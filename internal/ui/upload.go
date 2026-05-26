@@ -88,26 +88,25 @@ func NewUploadModel(client *sftpclient.Client, remoteDir string) UploadModel {
 
 // NewUploadModelMulti starts an upload of pre-known source paths without
 // prompting the user. Used for the two-pane F5 copy where the source list
-// is the active panel's selection.
+// is the active panel's selection — the view opens straight into progress.
 func NewUploadModelMulti(client *sftpclient.Client, remoteDir string, sources []string) UploadModel {
 	m := NewUploadModel(client, remoteDir)
 	m.presetSources = sources
+	m.state = uploadInProgress
+	m.startTime = time.Now()
+	m.eventCh = make(chan uploadEvent, 64)
+	m.decisionCh = make(chan userChoice, 1)
 	return m
 }
 
 func (m UploadModel) Init() tea.Cmd {
 	if len(m.presetSources) > 0 {
-		return tea.Batch(textinput.Blink, func() tea.Msg { return autoStartUploadMsg{} })
+		return tea.Batch(m.runUploads(m.presetSources), m.waitForEvent())
 	}
 	return textinput.Blink
 }
 
-// autoStartUploadMsg fires once on Init for preset-sources uploads, kicking
-// off the transfer without waiting for the user to press enter on an empty
-// destination input.
-type autoStartUploadMsg struct{}
-
-func (m UploadModel) start() tea.Cmd {
+func (m *UploadModel) start() tea.Cmd {
 	var sources []string
 	if len(m.presetSources) > 0 {
 		sources = m.presetSources
@@ -229,12 +228,6 @@ func (m UploadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.bar.Width = min(m.width-20, 80)
 		m.srcInput.Width = min(m.width-20, 80)
-
-	case autoStartUploadMsg:
-		if m.state == uploadEditSrc && len(m.presetSources) > 0 {
-			return m, m.start()
-		}
-		return m, nil
 
 	case uploadEventMsg:
 		ev := uploadEvent(msg)

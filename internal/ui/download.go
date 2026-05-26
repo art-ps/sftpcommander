@@ -50,24 +50,28 @@ const (
 )
 
 type DownloadModel struct {
-	client     *sftpclient.Client
-	entries    []sftpclient.FileEntry
-	localDir   string
-	destInput  textinput.Model
-	state      downloadState
-	bar        progress.Model
-	written    int64
-	total      int64
-	err        string
-	failure    *failureInfo
-	skipped    []string
-	skipAllOn  bool
-	startTime  time.Time
-	width      int
-	height     int
-	eventCh    chan downloadEvent
-	decisionCh chan userChoice
+	client      *sftpclient.Client
+	entries     []sftpclient.FileEntry
+	localDir    string
+	destInput   textinput.Model
+	state       downloadState
+	bar         progress.Model
+	written     int64
+	total       int64
+	err         string
+	failure     *failureInfo
+	skipped     []string
+	skipAllOn   bool
+	startTime   time.Time
+	width       int
+	height      int
+	eventCh     chan downloadEvent
+	decisionCh  chan userChoice
 	currentFile string
+	scanning    bool
+	scanFile    string
+	filesDone   int64
+	filesTotal  int64
 }
 
 func NewDownloadModel(client *sftpclient.Client, entries []sftpclient.FileEntry, localDir string) DownloadModel {
@@ -127,7 +131,7 @@ func (m DownloadModel) startDownload() tea.Cmd {
 			}
 		}
 		progressCb := func(p sftpclient.DownloadProgress) {
-			if p.File != "" {
+			if p.ScanFile == "" && p.File != "" {
 				p.File = filepath.Base(p.File)
 			}
 			select {
@@ -181,7 +185,13 @@ func (m *DownloadModel) beginDownload() tea.Cmd {
 			dest = filepath.Join(home, dest[2:])
 		}
 	}
-	if err := os.MkdirAll(dest, 0o755); err != nil {
+	// For a single file download dest is the target file path, not a directory.
+	// MkdirAll must only create its parent, not the path itself.
+	mkdirTarget := dest
+	if len(m.entries) == 1 && !m.entries[0].IsDir {
+		mkdirTarget = filepath.Dir(dest)
+	}
+	if err := os.MkdirAll(mkdirTarget, 0o755); err != nil {
 		m.err = "cannot create destination: " + err.Error()
 		return nil
 	}
@@ -212,9 +222,18 @@ func (m DownloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ev := downloadEvent(msg)
 		switch {
 		case ev.progress != nil:
-			m.written = ev.progress.Written
-			m.total = ev.progress.Total
-			m.currentFile = ev.progress.File
+			if ev.progress.ScanFile != "" {
+				m.scanning = true
+				m.scanFile = ev.progress.ScanFile
+				m.filesTotal++
+			} else {
+				m.scanning = false
+				m.written = ev.progress.Written
+				m.total = ev.progress.Total
+				m.currentFile = ev.progress.File
+				m.filesDone = ev.progress.FilesDone
+				m.filesTotal = ev.progress.FilesTotal
+			}
 			return m, m.waitForEvent()
 		case ev.failure != nil:
 			m.failure = ev.failure
@@ -321,7 +340,11 @@ func (m DownloadModel) View() string {
 			heading = "  Confirm destination"
 		}
 	case stateDownloading:
-		heading = "  Downloading " + kind
+		if m.scanning {
+			heading = "  Scanning..."
+		} else {
+			heading = "  Downloading " + kind
+		}
 	case stateAskContinue:
 		heading = "  File error"
 	case stateDone:
@@ -367,49 +390,60 @@ func (m DownloadModel) View() string {
 		body = append(body, "  "+keyHint("enter", "skip")+"   "+keyHint("c", "skip all")+"   "+keyHint("esc", "abort"))
 
 	case stateDownloading, stateDone:
-		var pct float64
-		if m.total > 0 {
-			pct = float64(m.written) / float64(m.total)
-		}
-		if m.state == stateDone {
-			pct = 1.0
-		}
-		elapsed := time.Since(m.startTime)
-		speed := ""
-		if elapsed.Seconds() > 0 && m.written > 0 {
-			bps := float64(m.written) / elapsed.Seconds()
-			speed = "  " + formatSize(int64(bps)) + "/s"
-		}
-
-		body = append(body, "  "+m.bar.ViewAs(pct), "")
-
-		var statusLine string
-		if m.state == stateDone {
-			doneMsg := "  Done! Saved to: " + m.localDir
-			if len(m.skipped) > 0 {
-				doneMsg += fmt.Sprintf("  (skipped %d)", len(m.skipped))
+		if m.scanning && m.state == stateDownloading {
+			body = append(body, styleKeyHint.Render("  Scanning:"))
+			body = append(body, stylePath.Render("  "+m.scanFile))
+			if m.filesTotal > 0 {
+				body = append(body, styleKeyHint.Render(fmt.Sprintf("  %d files found", m.filesTotal)))
 			}
-			statusLine = styleStatusOk.Render(doneMsg) +
-				"\n\n" + styleKeyHint.Render("  Press enter or q to go back")
 		} else {
-			written := formatSize(m.written)
-			total := ""
+			var pct float64
 			if m.total > 0 {
-				total = " / " + formatSize(m.total)
+				pct = float64(m.written) / float64(m.total)
 			}
-			statusLine = styleProgress.Render(fmt.Sprintf("  %s%s%s  %.0f%%", written, total, speed, pct*100))
-			if m.currentFile != "" {
-				statusLine += "\n" + styleKeyHint.Render("  Downloading: "+m.currentFile)
+			if m.state == stateDone {
+				pct = 1.0
 			}
-			if len(m.skipped) > 0 {
-				note := fmt.Sprintf("  %d skipped", len(m.skipped))
-				if m.skipAllOn {
-					note += " (skipping all errors)"
+			elapsed := time.Since(m.startTime)
+			speed := ""
+			if elapsed.Seconds() > 0 && m.written > 0 {
+				bps := float64(m.written) / elapsed.Seconds()
+				speed = "  " + formatSize(int64(bps)) + "/s"
+			}
+
+			body = append(body, "  "+m.bar.ViewAs(pct), "")
+
+			var statusLine string
+			if m.state == stateDone {
+				doneMsg := "  Done! Saved to: " + m.localDir
+				if len(m.skipped) > 0 {
+					doneMsg += fmt.Sprintf("  (skipped %d)", len(m.skipped))
 				}
-				statusLine += "\n" + styleKeyHint.Render(note)
+				statusLine = styleStatusOk.Render(doneMsg) +
+					"\n\n" + styleKeyHint.Render("  Press enter or q to go back")
+			} else {
+				written := formatSize(m.written)
+				total := ""
+				if m.total > 0 {
+					total = " / " + formatSize(m.total)
+				}
+				statusLine = styleProgress.Render(fmt.Sprintf("  %s%s%s  %.0f%%", written, total, speed, pct*100))
+				if m.filesTotal > 0 {
+					statusLine += "\n" + styleKeyHint.Render(fmt.Sprintf("  %d/%d files", m.filesDone, m.filesTotal))
+				}
+				if m.currentFile != "" {
+					statusLine += "\n" + styleKeyHint.Render("  Downloading: "+m.currentFile)
+				}
+				if len(m.skipped) > 0 {
+					note := fmt.Sprintf("  %d skipped", len(m.skipped))
+					if m.skipAllOn {
+						note += " (skipping all errors)"
+					}
+					statusLine += "\n" + styleKeyHint.Render(note)
+				}
 			}
+			body = append(body, statusLine)
 		}
-		body = append(body, statusLine)
 		body = append(body, "")
 		body = append(body, "  "+styleKeyHint.Render("Destination: ")+stylePath.Render(m.localDir))
 	}

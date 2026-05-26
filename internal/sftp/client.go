@@ -276,11 +276,21 @@ func AppendKnownHost(challenge *UnknownHostKeyError) error {
 	}
 	khPath := filepath.Join(home, ".ssh", "known_hosts")
 
-	addresses := []string{knownhosts.Normalize(challenge.Hostname)}
+	// Extract port from Address ("ip:port") to build correct known_hosts entries.
+	// knownhosts.Normalize("host:22") → "host", but
+	// knownhosts.Normalize("host:20022") → "[host]:20022" — crucial for non-standard ports.
+	_, port, _ := net.SplitHostPort(challenge.Address)
+	withPort := func(host string) string {
+		if port != "" {
+			return host + ":" + port
+		}
+		return host
+	}
+	addresses := []string{knownhosts.Normalize(withPort(challenge.Hostname))}
 	if challenge.Address != "" {
 		ip := stripPort(challenge.Address)
 		if ip != "" && ip != challenge.Hostname {
-			addresses = append(addresses, knownhosts.Normalize(ip))
+			addresses = append(addresses, knownhosts.Normalize(withPort(ip)))
 		}
 	}
 	line := knownhosts.Line(addresses, challenge.key)
@@ -346,9 +356,12 @@ func (c *Client) HomeDir() string {
 }
 
 type DownloadProgress struct {
-	Written int64
-	Total   int64
-	File    string
+	Written    int64
+	Total      int64
+	File       string
+	ScanFile   string // non-empty during pre-scan phase
+	FilesDone  int64  // completed files (download phase)
+	FilesTotal int64  // total files — accurate after scan, zero during scan
 }
 
 // progressWriter wraps an io.Writer and emits throttled progress callbacks.
@@ -374,11 +387,15 @@ func (w *progressWriter) Write(p []byte) (int, error) {
 }
 
 func (c *Client) DownloadFile(remotePath, localPath string, progress func(DownloadProgress)) error {
+	return downloadFileWith(c.sftp, remotePath, localPath, progress)
+}
+
+func downloadFileWith(sc *sftp.Client, remotePath, localPath string, progress func(DownloadProgress)) error {
 	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(localPath), err)
 	}
 
-	src, err := c.sftp.Open(remotePath)
+	src, err := sc.Open(remotePath)
 	if err != nil {
 		return fmt.Errorf("open remote %s: %w", remotePath, err)
 	}
@@ -463,9 +480,6 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 	var aborted atomic.Bool
 	var failureMu sync.Mutex
 
-	// Funnel failures from any worker through a single mutex so only one
-	// prompt is in flight at a time. Without onFailure we treat every error
-	// as fatal — caller asked for no skip path.
 	handleFailure := func(p string, err error) FailureDecision {
 		if aborted.Load() {
 			return DecisionAbort
@@ -486,34 +500,54 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 		return d
 	}
 
-	// Flatten dirs serially. ReadDir is RTT-bound but cheap compared to the
-	// transfer phase, and we need a total byte count for the progress bar.
-	var walkDir func(remote, local string) []fileTask
-	walkDir = func(remote, local string) []fileTask {
+	// Phase 1: scan all files, collect tasks and total size.
+	var tasks []fileTask
+	var totalBytes int64
+
+	// emitScanFile throttles per-file scan events so they don't flood the
+	// channel. Directory events (emitted before each List round-trip) are
+	// always sent unthrottled — they show what we're waiting for during the
+	// network pause and are rare enough not to overwhelm the channel.
+	var lastScanEmit time.Time
+	emitScanFile := func(p string) {
+		if progress == nil || time.Since(lastScanEmit) < 50*time.Millisecond {
+			return
+		}
+		lastScanEmit = time.Now()
+		progress(DownloadProgress{ScanFile: p})
+	}
+
+	var walkDir func(remote, local string)
+	walkDir = func(remote, local string) {
 		if aborted.Load() {
-			return nil
+			return
+		}
+		// Emit directory path before the List() round-trip so the UI shows
+		// what we're waiting for during the network pause instead of hanging
+		// on the last file name.
+		if progress != nil {
+			progress(DownloadProgress{ScanFile: remote + "/"})
 		}
 		entries, err := c.List(remote)
 		if err != nil {
 			handleFailure(remote, err)
-			return nil
+			return
 		}
-		var out []fileTask
 		for _, e := range entries {
 			if aborted.Load() {
-				return out
+				return
 			}
 			localChild := filepath.Join(local, e.Name)
 			if e.IsDir {
-				out = append(out, walkDir(e.Path, localChild)...)
+				walkDir(e.Path, localChild)
 			} else {
-				out = append(out, fileTask{remote: e.Path, local: localChild, size: e.Size})
+				totalBytes += e.Size
+				tasks = append(tasks, fileTask{remote: e.Path, local: localChild, size: e.Size})
+				emitScanFile(e.Path)
 			}
 		}
-		return out
 	}
 
-	var tasks []fileTask
 	for _, item := range items {
 		if aborted.Load() {
 			break
@@ -524,37 +558,43 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 				handleFailure(item.RemotePath, err)
 				continue
 			}
+			totalBytes += stat.Size()
 			tasks = append(tasks, fileTask{remote: item.RemotePath, local: item.LocalPath, size: stat.Size()})
-			continue
+			emitScanFile(item.RemotePath)
+		} else {
+			walkDir(item.RemotePath, item.LocalPath)
 		}
-		tasks = append(tasks, walkDir(item.RemotePath, item.LocalPath)...)
 	}
 
 	if aborted.Load() || len(tasks) == 0 {
 		return nil
 	}
 
-	var totalBytes int64
+	// Phase 2: download all collected tasks in parallel with a fixed total.
+	taskCh := make(chan fileTask, len(tasks))
 	for _, t := range tasks {
-		totalBytes += t.size
+		taskCh <- t
 	}
+	close(taskCh)
 
-	// Aggregator: each worker calls perFileProgress with that file's running
-	// Written/Total. We sum across all known files (live and finished) and
-	// emit one throttled DownloadProgress with batch totals.
 	var (
-		aggMu    sync.Mutex
-		perFile  = make(map[string]int64, len(tasks))
-		active   = make(map[string]bool)
-		lastEmit time.Time
+		aggMu          sync.Mutex
+		perFile        = make(map[string]int64)
+		active         = make(map[string]bool)
+		completedFiles = make(map[string]bool)
+		filesDone      int64
+		lastEmit       time.Time
 	)
 	perFileProgress := func(p DownloadProgress) {
 		aggMu.Lock()
 		perFile[p.File] = p.Written
-		// Total==0 means a zero-byte file (DownloadFile's final emit still
-		// fires for it); treat as instantly done.
-		if p.Total == 0 || p.Written >= p.Total {
+		done := p.Total == 0 || p.Written >= p.Total
+		if done {
 			delete(active, p.File)
+			if !completedFiles[p.File] {
+				completedFiles[p.File] = true
+				filesDone++
+			}
 		} else {
 			active[p.File] = true
 		}
@@ -571,45 +611,49 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 			current = f
 			break
 		}
+		fd := filesDone
 		aggMu.Unlock()
 		if shouldEmit && progress != nil {
-			progress(DownloadProgress{Written: written, Total: totalBytes, File: current})
+			progress(DownloadProgress{Written: written, Total: totalBytes, File: current, FilesDone: fd, FilesTotal: int64(len(tasks))})
 		}
 	}
 
-	taskCh := make(chan fileTask)
 	var wg sync.WaitGroup
 	for i := 0; i < parallel; i++ {
 		wg.Go(func() {
+			// Each worker gets its own SFTP session (separate SSH channel with
+			// independent flow-control window). Sharing one session serialises
+			// all READ requests through one channel and kills throughput.
+			sc, err := sftp.NewClient(c.ssh,
+				sftp.UseConcurrentReads(true),
+				sftp.MaxConcurrentRequestsPerFile(64),
+			)
+			if err != nil {
+				sc = c.sftp // fall back to shared session
+			} else {
+				defer sc.Close()
+			}
 			for t := range taskCh {
 				if aborted.Load() {
 					continue
 				}
-				if err := c.DownloadFile(t.remote, t.local, perFileProgress); err != nil {
+				if err := downloadFileWith(sc, t.remote, t.local, perFileProgress); err != nil {
 					handleFailure(t.remote, err)
 				}
 			}
 		})
 	}
-	for _, t := range tasks {
-		if aborted.Load() {
-			break
-		}
-		taskCh <- t
-	}
-	close(taskCh)
 	wg.Wait()
 
 	if progress != nil {
-		// Final aggregate emit so the UI sees 100% (or whatever was actually
-		// transferred if some files were skipped).
 		aggMu.Lock()
 		var written int64
 		for _, w := range perFile {
 			written += w
 		}
+		fd := filesDone
 		aggMu.Unlock()
-		progress(DownloadProgress{Written: written, Total: totalBytes, File: ""})
+		progress(DownloadProgress{Written: written, Total: totalBytes, File: "", FilesDone: fd, FilesTotal: int64(len(tasks))})
 	}
 
 	return nil
