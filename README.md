@@ -1,6 +1,6 @@
 <div align="center">
 
-# sftpcommander
+# SFTP Commander
 
 A keyboard-driven terminal SFTP client. Browse, transfer, and manage remote
 files without leaving the shell — with a Midnight-Commander-style two-pane
