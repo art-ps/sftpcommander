@@ -1,7 +1,7 @@
 package ui
 
 import (
-	sftpclient "sftpbrowser/internal/sftp"
+	sftpclient "github.com/art-ps/sftpcommander/internal/sftp"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"

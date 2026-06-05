@@ -1,6 +1,8 @@
 package sftp
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,17 +24,50 @@ import (
 )
 
 type FileEntry struct {
-	Name    string
-	Path    string
-	IsDir   bool
-	Size    int64
-	Mode    os.FileMode
-	ModTime time.Time
+	Name      string
+	Path      string
+	IsDir     bool
+	IsSymlink bool
+	Size      int64
+	Mode      os.FileMode
+	ModTime   time.Time
 }
 
 type Client struct {
-	ssh  *ssh.Client
-	sftp *sftp.Client
+	ssh         *ssh.Client
+	sftp        *sftp.Client
+	sessionPool chan *sftp.Client
+}
+
+const maxPooledSessions = 32
+
+// AcquireSession returns a worker-private sftp.Client (own SSH channel,
+// independent flow-control window) from the pool, or creates a new one if the
+// pool is empty. The returned release fn returns the session to the pool, or
+// closes it if the pool is already full. Workers must always call release
+// when done; on error the session is closed instead of pooled.
+func (c *Client) AcquireSession() (*sftp.Client, func(), error) {
+	select {
+	case s := <-c.sessionPool:
+		return s, func() { c.releaseSession(s) }, nil
+	default:
+	}
+	s, err := sftp.NewClient(c.ssh,
+		sftp.UseConcurrentReads(true),
+		sftp.MaxConcurrentRequestsPerFile(64),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return s, func() { c.releaseSession(s) }, nil
+}
+
+func (c *Client) releaseSession(s *sftp.Client) {
+	select {
+	case c.sessionPool <- s:
+	default:
+		s.Close()
+	}
 }
 
 // UnknownHostKeyError is returned when the server's host key is not in
@@ -86,7 +122,25 @@ func (e *ChangedHostKeyError) Error() string {
 }
 
 func Connect(host, port, user, password, keyPath, keyPassphrase string) (*Client, error) {
-	client, err := connectOnce(host, port, user, password, keyPath, keyPassphrase, nil)
+	return ConnectWithProxy(host, port, user, password, keyPath, keyPassphrase, "")
+}
+
+// ConnectWithProxy is like Connect but routes the SSH session through the
+// given ProxyJump alias from ~/.ssh/config (single hop). Empty proxyJump is
+// equivalent to Connect. The jump host authenticates via ssh-agent and/or the
+// IdentityFile declared in its own ssh_config block — passwords are not
+// prompted for the jump.
+func ConnectWithProxy(host, port, user, password, keyPath, keyPassphrase, proxyJump string) (*Client, error) {
+	var jumpClient *ssh.Client
+	if proxyJump != "" {
+		jc, err := dialJumpHost(proxyJump)
+		if err != nil {
+			return nil, fmt.Errorf("proxy jump %s: %w", proxyJump, err)
+		}
+		jumpClient = jc
+	}
+
+	client, err := connectOnce(host, port, user, password, keyPath, keyPassphrase, nil, jumpClient)
 	if err == nil {
 		return client, nil
 	}
@@ -97,12 +151,54 @@ func Connect(host, port, user, password, keyPath, keyPassphrase string) (*Client
 	var chg *ChangedHostKeyError
 	if errors.As(err, &chg) && len(chg.knownTypes) > 0 &&
 		!slices.Contains(chg.knownTypes, chg.KeyType) {
-		return connectOnce(host, port, user, password, keyPath, keyPassphrase, chg.knownTypes)
+		return connectOnce(host, port, user, password, keyPath, keyPassphrase, chg.knownTypes, jumpClient)
+	}
+	if jumpClient != nil {
+		jumpClient.Close()
 	}
 	return nil, err
 }
 
-func connectOnce(host, port, user, password, keyPath, keyPassphrase string, hostKeyAlgorithms []string) (*Client, error) {
+func dialJumpHost(alias string) (*ssh.Client, error) {
+	cfg := LookupSSHConfig(alias)
+	host := cfg.HostName
+	if host == "" {
+		host = alias
+	}
+	port := cfg.Port
+	if port == "" {
+		port = "22"
+	}
+	user := cfg.User
+	if user == "" {
+		if u := os.Getenv("USER"); u != "" {
+			user = u
+		}
+	}
+	return sshDial(host, port, user, "", cfg.IdentityFile, "", nil, nil)
+}
+
+func connectOnce(host, port, user, password, keyPath, keyPassphrase string, hostKeyAlgorithms []string, jumpClient *ssh.Client) (*Client, error) {
+	sshClient, err := sshDial(host, port, user, password, keyPath, keyPassphrase, hostKeyAlgorithms, jumpClient)
+	if err != nil {
+		return nil, err
+	}
+	sftpClient, err := sftp.NewClient(sshClient,
+		sftp.UseConcurrentReads(true),
+		sftp.MaxConcurrentRequestsPerFile(64),
+	)
+	if err != nil {
+		sshClient.Close()
+		return nil, fmt.Errorf("sftp client: %w", err)
+	}
+	return &Client{
+		ssh:         sshClient,
+		sftp:        sftpClient,
+		sessionPool: make(chan *sftp.Client, maxPooledSessions),
+	}, nil
+}
+
+func sshDial(host, port, user, password, keyPath, keyPassphrase string, hostKeyAlgorithms []string, jumpClient *ssh.Client) (*ssh.Client, error) {
 	var authMethods []ssh.AuthMethod
 
 	// 1) ssh-agent (if SSH_AUTH_SOCK is set and reachable).
@@ -169,28 +265,44 @@ func connectOnce(host, port, user, password, keyPath, keyPassphrase string, host
 		Timeout:           15 * time.Second,
 	}
 
-	sshClient, err := ssh.Dial("tcp", host+":"+port, config)
-	if err != nil {
-		// Prefer typed host-key errors over the wrapped handshake error.
-		if unknownHost != nil {
-			return nil, unknownHost
+	addr := host + ":" + port
+	var sshClient *ssh.Client
+	if jumpClient != nil {
+		// Tunnel a TCP connection through the jump host, then negotiate SSH
+		// over it. ssh.Dial can't take a custom net.Conn, so we go through
+		// NewClientConn manually.
+		nconn, derr := jumpClient.Dial("tcp", addr)
+		if derr != nil {
+			return nil, fmt.Errorf("ssh dial via jump: %w", derr)
 		}
-		if changedHost != nil {
-			return nil, changedHost
+		c, chans, reqs, herr := ssh.NewClientConn(nconn, addr, config)
+		if herr != nil {
+			nconn.Close()
+			if unknownHost != nil {
+				return nil, unknownHost
+			}
+			if changedHost != nil {
+				return nil, changedHost
+			}
+			return nil, fmt.Errorf("ssh handshake via jump: %w", herr)
 		}
-		return nil, fmt.Errorf("ssh dial: %w", err)
+		sshClient = ssh.NewClient(c, chans, reqs)
+	} else {
+		var derr error
+		sshClient, derr = ssh.Dial("tcp", addr, config)
+		if derr != nil {
+			// Prefer typed host-key errors over the wrapped handshake error.
+			if unknownHost != nil {
+				return nil, unknownHost
+			}
+			if changedHost != nil {
+				return nil, changedHost
+			}
+			return nil, fmt.Errorf("ssh dial: %w", derr)
+		}
 	}
 
-	sftpClient, err := sftp.NewClient(sshClient,
-		sftp.UseConcurrentReads(true),
-		sftp.MaxConcurrentRequestsPerFile(64),
-	)
-	if err != nil {
-		sshClient.Close()
-		return nil, fmt.Errorf("sftp client: %w", err)
-	}
-
-	return &Client{ssh: sshClient, sftp: sftpClient}, nil
+	return sshClient, nil
 }
 
 func makeHostKeyCallback(unknownOut **UnknownHostKeyError, changedOut **ChangedHostKeyError) (ssh.HostKeyCallback, error) {
@@ -279,12 +391,15 @@ func AppendKnownHost(challenge *UnknownHostKeyError) error {
 	// Extract port from Address ("ip:port") to build correct known_hosts entries.
 	// knownhosts.Normalize("host:22") → "host", but
 	// knownhosts.Normalize("host:20022") → "[host]:20022" — crucial for non-standard ports.
+	// IPv6 hostnames must be bracketed before joining with a port or
+	// net.JoinHostPort/Normalize can't parse them back ("::1:2222" is
+	// ambiguous; "[::1]:2222" is not).
 	_, port, _ := net.SplitHostPort(challenge.Address)
 	withPort := func(host string) string {
-		if port != "" {
-			return host + ":" + port
+		if port == "" {
+			return host
 		}
-		return host
+		return net.JoinHostPort(host, port)
 	}
 	addresses := []string{knownhosts.Normalize(withPort(challenge.Hostname))}
 	if challenge.Address != "" {
@@ -313,8 +428,16 @@ func AppendKnownHost(challenge *UnknownHostKeyError) error {
 }
 
 func (c *Client) Close() {
-	c.sftp.Close()
-	c.ssh.Close()
+	for {
+		select {
+		case s := <-c.sessionPool:
+			s.Close()
+		default:
+			c.sftp.Close()
+			c.ssh.Close()
+			return
+		}
+	}
 }
 
 func (c *Client) List(remotePath string) ([]FileEntry, error) {
@@ -336,12 +459,13 @@ func (c *Client) List(remotePath string) ([]FileEntry, error) {
 			continue
 		}
 		entries = append(entries, FileEntry{
-			Name:    info.Name(),
-			Path:    path.Join(remotePath, info.Name()),
-			IsDir:   info.IsDir(),
-			Size:    info.Size(),
-			Mode:    info.Mode(),
-			ModTime: info.ModTime(),
+			Name:      info.Name(),
+			Path:      path.Join(remotePath, info.Name()),
+			IsDir:     info.IsDir(),
+			IsSymlink: info.Mode()&os.ModeSymlink != 0,
+			Size:      info.Size(),
+			Mode:      info.Mode(),
+			ModTime:   info.ModTime(),
 		})
 	}
 	return entries, nil
@@ -387,10 +511,15 @@ func (w *progressWriter) Write(p []byte) (int, error) {
 }
 
 func (c *Client) DownloadFile(remotePath, localPath string, progress func(DownloadProgress)) error {
-	return downloadFileWith(c.sftp, remotePath, localPath, progress)
+	return downloadFileWith(c.sftp, remotePath, localPath, 0, progress)
 }
 
-func downloadFileWith(sc *sftp.Client, remotePath, localPath string, progress func(DownloadProgress)) error {
+// downloadFileWith pulls remotePath into localPath. When startOffset > 0 the
+// local file is opened without truncation and both sides are seeked to the
+// offset — used by the resume path. The concurrent-reads fast path
+// (sftp.File.WriteTo) cannot honor a non-zero start offset, so resumed
+// transfers fall back to a single-stream io.Copy.
+func downloadFileWith(sc *sftp.Client, remotePath, localPath string, startOffset int64, progress func(DownloadProgress)) error {
 	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(localPath), err)
 	}
@@ -406,20 +535,43 @@ func downloadFileWith(sc *sftp.Client, remotePath, localPath string, progress fu
 		return fmt.Errorf("stat remote %s: %w", remotePath, err)
 	}
 
-	dst, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("create local %s: %w", localPath, err)
+	var dst *os.File
+	if startOffset > 0 {
+		dst, err = os.OpenFile(localPath, os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("open local %s for resume: %w", localPath, err)
+		}
+		if _, err := dst.Seek(startOffset, io.SeekStart); err != nil {
+			dst.Close()
+			return fmt.Errorf("seek local %s: %w", localPath, err)
+		}
+		if _, err := src.Seek(startOffset, io.SeekStart); err != nil {
+			dst.Close()
+			return fmt.Errorf("seek remote %s: %w", remotePath, err)
+		}
+	} else {
+		dst, err = os.Create(localPath)
+		if err != nil {
+			return fmt.Errorf("create local %s: %w", localPath, err)
+		}
 	}
 	defer dst.Close()
 
 	pw := &progressWriter{
 		dst:      dst,
+		written:  startOffset,
 		total:    stat.Size(),
 		file:     remotePath,
 		progress: progress,
 	}
-	if _, err := src.WriteTo(pw); err != nil {
-		return fmt.Errorf("download %s: %w", remotePath, err)
+	if startOffset > 0 {
+		if _, err := io.Copy(pw, src); err != nil {
+			return fmt.Errorf("download %s: %w", remotePath, err)
+		}
+	} else {
+		if _, err := src.WriteTo(pw); err != nil {
+			return fmt.Errorf("download %s: %w", remotePath, err)
+		}
 	}
 	if progress != nil {
 		progress(DownloadProgress{Written: pw.written, Total: pw.total, File: remotePath})
@@ -434,6 +586,23 @@ const (
 	DecisionSkip
 )
 
+type OverwriteDecision int
+
+const (
+	OverwriteAbort OverwriteDecision = iota
+	OverwriteSkip
+	OverwriteReplace
+	// OverwriteResume — destination is a prefix of source; continue writing
+	// from existingSize. Only meaningful when existingSize < newSize, the
+	// callback is expected to enforce that.
+	OverwriteResume
+)
+
+// OverwriteCallback is invoked when a destination file already exists.
+// existingSize/newSize help the UI show a meaningful prompt. The caller is
+// expected to be sticky on "all"-variants on its own side.
+type OverwriteCallback func(path string, existingSize, newSize int64) OverwriteDecision
+
 // BatchItem describes a single download target: file or directory tree.
 type BatchItem struct {
 	RemotePath string
@@ -441,17 +610,66 @@ type BatchItem struct {
 	IsDir      bool
 }
 
-// BatchOptions tunes DownloadBatch. Parallel <= 0 falls back to 4; values
-// above 32 are capped because each worker holds its own SFTP read pipeline
-// and the server typically refuses past that.
+// BatchOptions tunes DownloadBatch/UploadBatch. Parallel <= 0 falls back to
+// 4; values above 32 are capped because each worker holds its own SFTP
+// pipeline and the server typically refuses past that. OnOverwrite is
+// invoked from a worker goroutine when the destination file already exists
+// and must be safe to call concurrently.
+// Verify enables a post-transfer SHA256 check: local sum vs `sha256sum`
+// executed on the server over an ssh.Session. Mismatches are reported via
+// onFailure.
 type BatchOptions struct {
-	Parallel int
+	Parallel    int
+	OnOverwrite OverwriteCallback
+	Verify      bool
+}
+
+// SHA256Remote runs `sha256sum -- path` over a fresh ssh session and parses
+// the first hex token. Requires `sha256sum` in the server's PATH.
+func (c *Client) SHA256Remote(remotePath string) (string, error) {
+	session, err := c.ssh.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("new session: %w", err)
+	}
+	defer session.Close()
+	cmd := "sha256sum -- " + shellQuote(remotePath)
+	out, err := session.CombinedOutput(cmd)
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return "", fmt.Errorf("sha256sum: %s", msg)
+		}
+		return "", fmt.Errorf("sha256sum: %w", err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("sha256sum: empty output")
+	}
+	return fields[0], nil
+}
+
+func sha256Local(p string) (string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 type fileTask struct {
 	remote string
 	local  string
 	size   int64
+}
+
+type scanJob struct {
+	remote string
+	local  string
 }
 
 // DownloadBatch downloads many files (and/or directory trees) in parallel.
@@ -500,54 +718,153 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 		return d
 	}
 
-	// Phase 1: scan all files, collect tasks and total size.
-	var tasks []fileTask
-	var totalBytes int64
+	// Phase 1: parallel scan. Scan workers consume a shared queue of
+	// directories, each acquiring its own SFTP session so concurrent List
+	// calls run on independent SSH channels. Files and subdir jobs are
+	// pushed back under scanMu; termination fires when no dir is queued
+	// AND none is in-flight (tracked by scanPending).
+	var (
+		scanMu      sync.Mutex
+		tasks       []fileTask
+		totalBytes  int64
+		visited     = map[string]bool{}
+		scanJobs    []scanJob
+		scanPending int
+		scanClosed  bool
+	)
+	scanCond := sync.NewCond(&scanMu)
 
-	// emitScanFile throttles per-file scan events so they don't flood the
-	// channel. Directory events (emitted before each List round-trip) are
-	// always sent unthrottled — they show what we're waiting for during the
-	// network pause and are rare enough not to overwhelm the channel.
-	var lastScanEmit time.Time
-	emitScanFile := func(p string) {
-		if progress == nil || time.Since(lastScanEmit) < 50*time.Millisecond {
+	pushDir := func(j scanJob) {
+		scanMu.Lock()
+		if visited[j.remote] {
+			scanMu.Unlock()
 			return
 		}
-		lastScanEmit = time.Now()
-		progress(DownloadProgress{ScanFile: p})
+		visited[j.remote] = true
+		scanJobs = append(scanJobs, j)
+		scanPending++
+		scanCond.Signal()
+		scanMu.Unlock()
+	}
+	popDir := func() (scanJob, bool) {
+		scanMu.Lock()
+		for len(scanJobs) == 0 && !scanClosed {
+			scanCond.Wait()
+		}
+		if len(scanJobs) == 0 {
+			scanMu.Unlock()
+			return scanJob{}, false
+		}
+		n := len(scanJobs) - 1
+		j := scanJobs[n]
+		scanJobs = scanJobs[:n]
+		scanMu.Unlock()
+		return j, true
+	}
+	doneDir := func() {
+		scanMu.Lock()
+		scanPending--
+		if scanPending == 0 {
+			scanClosed = true
+			scanCond.Broadcast()
+		}
+		scanMu.Unlock()
 	}
 
-	var walkDir func(remote, local string)
-	walkDir = func(remote, local string) {
+	var scanLastEmit atomic.Int64
+	emitScanFile := func(p string) {
+		if progress == nil {
+			return
+		}
+		now := time.Now().UnixNano()
+		last := scanLastEmit.Load()
+		if now-last < int64(50*time.Millisecond) {
+			return
+		}
+		if !scanLastEmit.CompareAndSwap(last, now) {
+			return
+		}
+		scanMu.Lock()
+		n := int64(len(tasks))
+		tb := totalBytes
+		scanMu.Unlock()
+		progress(DownloadProgress{ScanFile: p, FilesTotal: n, Total: tb})
+	}
+
+	walkOne := func(sc *sftp.Client, j scanJob) {
 		if aborted.Load() {
 			return
 		}
-		// Emit directory path before the List() round-trip so the UI shows
-		// what we're waiting for during the network pause instead of hanging
-		// on the last file name.
 		if progress != nil {
-			progress(DownloadProgress{ScanFile: remote + "/"})
+			progress(DownloadProgress{ScanFile: j.remote + "/"})
 		}
-		entries, err := c.List(remote)
+		infos, err := sc.ReadDir(j.remote)
 		if err != nil {
-			handleFailure(remote, err)
+			handleFailure(j.remote, err)
 			return
 		}
-		for _, e := range entries {
+		var (
+			localTasks []fileTask
+			localBytes int64
+			subDirs    []scanJob
+			lastFile   string
+		)
+		for _, info := range infos {
 			if aborted.Load() {
 				return
 			}
-			localChild := filepath.Join(local, e.Name)
-			if e.IsDir {
-				walkDir(e.Path, localChild)
-			} else {
-				totalBytes += e.Size
-				tasks = append(tasks, fileTask{remote: e.Path, local: localChild, size: e.Size})
-				emitScanFile(e.Path)
+			if info.Name() == "." || info.Name() == ".." {
+				continue
 			}
+			ePath := path.Join(j.remote, info.Name())
+			localChild := filepath.Join(j.local, info.Name())
+			switch {
+			case info.Mode()&os.ModeSymlink != 0:
+				target, lerr := sc.ReadLink(ePath)
+				if lerr != nil {
+					handleFailure(ePath, lerr)
+					continue
+				}
+				resolved := target
+				if !path.IsAbs(resolved) {
+					resolved = path.Join(path.Dir(ePath), resolved)
+				}
+				tinfo, terr := sc.Stat(resolved)
+				if terr != nil {
+					handleFailure(ePath, terr)
+					continue
+				}
+				if tinfo.IsDir() {
+					subDirs = append(subDirs, scanJob{remote: resolved, local: localChild})
+					continue
+				}
+				localBytes += tinfo.Size()
+				localTasks = append(localTasks, fileTask{remote: resolved, local: localChild, size: tinfo.Size()})
+				lastFile = resolved
+			case info.IsDir():
+				subDirs = append(subDirs, scanJob{remote: ePath, local: localChild})
+			default:
+				localBytes += info.Size()
+				localTasks = append(localTasks, fileTask{remote: ePath, local: localChild, size: info.Size()})
+				lastFile = ePath
+			}
+		}
+		if len(localTasks) > 0 {
+			scanMu.Lock()
+			tasks = append(tasks, localTasks...)
+			totalBytes += localBytes
+			scanMu.Unlock()
+		}
+		for _, sd := range subDirs {
+			pushDir(sd)
+		}
+		if lastFile != "" {
+			emitScanFile(lastFile)
 		}
 	}
 
+	// Seed: single-file items handled inline (one Stat each, no point
+	// parallelising); directories enqueued for the scan pool.
 	for _, item := range items {
 		if aborted.Load() {
 			break
@@ -562,8 +879,41 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 			tasks = append(tasks, fileTask{remote: item.RemotePath, local: item.LocalPath, size: stat.Size()})
 			emitScanFile(item.RemotePath)
 		} else {
-			walkDir(item.RemotePath, item.LocalPath)
+			pushDir(scanJob{remote: item.RemotePath, local: item.LocalPath})
 		}
+	}
+
+	// Run scan workers only if any directory was queued. Cap at 8 — beyond
+	// that the SSH server typically refuses extra channels and the linear
+	// speedup tapers off anyway.
+	scanMu.Lock()
+	hasDirs := scanPending > 0
+	scanMu.Unlock()
+	if hasDirs {
+		scanWorkers := parallel
+		if scanWorkers > 8 {
+			scanWorkers = 8
+		}
+		var swg sync.WaitGroup
+		for i := 0; i < scanWorkers; i++ {
+			swg.Go(func() {
+				sc, release, err := c.AcquireSession()
+				if err != nil {
+					sc = c.sftp
+				} else {
+					defer release()
+				}
+				for {
+					j, ok := popDir()
+					if !ok {
+						return
+					}
+					walkOne(sc, j)
+					doneDir()
+				}
+			})
+		}
+		swg.Wait()
 	}
 
 	if aborted.Load() || len(tasks) == 0 {
@@ -577,45 +927,69 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 	}
 	close(taskCh)
 
+	// Atomic aggregator. In-flight delta updates write to `written` directly;
+	// `currentFile` is best-effort (whichever worker most recently posted is
+	// shown). `lastEmit` throttles via CAS so only one worker per 50ms wins
+	// the right to emit, the rest just update counters and move on.
 	var (
-		aggMu          sync.Mutex
-		perFile        = make(map[string]int64)
-		active         = make(map[string]bool)
-		completedFiles = make(map[string]bool)
-		filesDone      int64
-		lastEmit       time.Time
+		written     atomic.Int64
+		filesDone   atomic.Int64
+		lastEmit    atomic.Int64
+		currentFile atomic.Value
 	)
-	perFileProgress := func(p DownloadProgress) {
-		aggMu.Lock()
-		perFile[p.File] = p.Written
-		done := p.Total == 0 || p.Written >= p.Total
-		if done {
-			delete(active, p.File)
-			if !completedFiles[p.File] {
-				completedFiles[p.File] = true
-				filesDone++
-			}
-		} else {
-			active[p.File] = true
+	currentFile.Store("")
+	filesTotal := int64(len(tasks))
+	emitNow := func() {
+		if progress == nil {
+			return
 		}
-		var written int64
-		for _, w := range perFile {
-			written += w
+		cur, _ := currentFile.Load().(string)
+		progress(DownloadProgress{
+			Written:    written.Load(),
+			Total:      totalBytes,
+			File:       cur,
+			FilesDone:  filesDone.Load(),
+			FilesTotal: filesTotal,
+		})
+	}
+	maybeEmit := func() {
+		now := time.Now().UnixNano()
+		last := lastEmit.Load()
+		if now-last < int64(50*time.Millisecond) {
+			return
 		}
-		shouldEmit := time.Since(lastEmit) >= 50*time.Millisecond
-		if shouldEmit {
-			lastEmit = time.Now()
+		if !lastEmit.CompareAndSwap(last, now) {
+			return
 		}
-		var current string
-		for f := range active {
-			current = f
-			break
+		emitNow()
+	}
+	forceEmit := func() {
+		lastEmit.Store(time.Now().UnixNano())
+		emitNow()
+	}
+
+	var overwriteMu sync.Mutex
+	checkOverwrite := func(localPath string, newSize int64) OverwriteDecision {
+		if opts.OnOverwrite == nil {
+			return OverwriteReplace
 		}
-		fd := filesDone
-		aggMu.Unlock()
-		if shouldEmit && progress != nil {
-			progress(DownloadProgress{Written: written, Total: totalBytes, File: current, FilesDone: fd, FilesTotal: int64(len(tasks))})
+		info, err := os.Stat(localPath)
+		if err != nil {
+			return OverwriteReplace
 		}
+		if info.IsDir() {
+			return OverwriteSkip
+		}
+		overwriteMu.Lock()
+		defer overwriteMu.Unlock()
+		if aborted.Load() {
+			return OverwriteAbort
+		}
+		d := opts.OnOverwrite(localPath, info.Size(), newSize)
+		if d == OverwriteAbort {
+			aborted.Store(true)
+		}
+		return d
 	}
 
 	var wg sync.WaitGroup
@@ -624,38 +998,98 @@ func (c *Client) DownloadBatch(items []BatchItem, opts BatchOptions, progress fu
 			// Each worker gets its own SFTP session (separate SSH channel with
 			// independent flow-control window). Sharing one session serialises
 			// all READ requests through one channel and kills throughput.
-			sc, err := sftp.NewClient(c.ssh,
-				sftp.UseConcurrentReads(true),
-				sftp.MaxConcurrentRequestsPerFile(64),
-			)
+			sc, release, err := c.AcquireSession()
 			if err != nil {
 				sc = c.sftp // fall back to shared session
 			} else {
-				defer sc.Close()
+				defer release()
 			}
 			for t := range taskCh {
 				if aborted.Load() {
 					continue
 				}
-				if err := downloadFileWith(sc, t.remote, t.local, perFileProgress); err != nil {
-					handleFailure(t.remote, err)
+				var resumeOffset int64
+				switch checkOverwrite(t.local, t.size) {
+				case OverwriteSkip:
+					written.Add(t.size)
+					filesDone.Add(1)
+					currentFile.Store(t.remote)
+					forceEmit()
+					continue
+				case OverwriteAbort:
+					continue
+				case OverwriteResume:
+					if info, err := os.Stat(t.local); err == nil {
+						resumeOffset = info.Size()
+						written.Add(resumeOffset)
+					}
 				}
+				sentSoFar := resumeOffset
+				fileProgress := func(p DownloadProgress) {
+					if p.Written > sentSoFar {
+						written.Add(p.Written - sentSoFar)
+						sentSoFar = p.Written
+					}
+					currentFile.Store(t.remote)
+					maybeEmit()
+				}
+				if err := downloadFileWith(sc, t.remote, t.local, resumeOffset, fileProgress); err != nil {
+					handleFailure(t.remote, err)
+					continue
+				}
+				if opts.Verify {
+					if err := c.verifyDownloaded(t.remote, t.local); err != nil {
+						handleFailure(t.remote, err)
+					}
+				}
+				filesDone.Add(1)
+				currentFile.Store(t.remote)
+				forceEmit()
 			}
 		})
 	}
 	wg.Wait()
 
 	if progress != nil {
-		aggMu.Lock()
-		var written int64
-		for _, w := range perFile {
-			written += w
-		}
-		fd := filesDone
-		aggMu.Unlock()
-		progress(DownloadProgress{Written: written, Total: totalBytes, File: "", FilesDone: fd, FilesTotal: int64(len(tasks))})
+		currentFile.Store("")
+		forceEmit()
 	}
 
+	return nil
+}
+
+// verifyDownloaded computes local SHA256 of localPath and compares it to
+// `sha256sum remote` on the server. Returns a "checksum mismatch" error on
+// disagreement so the batch driver can surface it via onFailure like any
+// other per-file error.
+func (c *Client) verifyDownloaded(remote, local string) error {
+	remoteHash, err := c.SHA256Remote(remote)
+	if err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	localHash, err := sha256Local(local)
+	if err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	if !strings.EqualFold(remoteHash, localHash) {
+		return fmt.Errorf("checksum mismatch: remote=%s local=%s", remoteHash, localHash)
+	}
+	return nil
+}
+
+// verifyUploaded is the upload-direction counterpart of verifyDownloaded.
+func (c *Client) verifyUploaded(local, remote string) error {
+	localHash, err := sha256Local(local)
+	if err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	remoteHash, err := c.SHA256Remote(remote)
+	if err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	if !strings.EqualFold(remoteHash, localHash) {
+		return fmt.Errorf("checksum mismatch: remote=%s local=%s", remoteHash, localHash)
+	}
 	return nil
 }
 
@@ -696,6 +1130,12 @@ func (c *Client) DownloadDir(remotePath, localPath string, progress func(Downloa
 
 func (c *Client) Stat(path string) (os.FileInfo, error) {
 	return c.sftp.Stat(path)
+}
+
+// Readlink returns the literal target of a symlink (relative or absolute,
+// as stored on the server). Used for "→ target" display next to symlinks.
+func (c *Client) Readlink(p string) (string, error) {
+	return c.sftp.ReadLink(p)
 }
 
 // Remove deletes a file. For directories use RemoveAll.
@@ -746,6 +1186,33 @@ func (c *Client) Chmod(p string, mode os.FileMode) error {
 	return c.sftp.Chmod(p, mode)
 }
 
+// CopyRemote duplicates src to dst on the server via an `cp -R` exec session.
+// SFTP itself has no copy primitive so bytes would otherwise have to travel
+// through the client. Requires a POSIX-ish remote with `cp` in PATH.
+func (c *Client) CopyRemote(src, dst string) error {
+	session, err := c.ssh.NewSession()
+	if err != nil {
+		return fmt.Errorf("new session: %w", err)
+	}
+	defer session.Close()
+	cmd := "cp -R -- " + shellQuote(src) + " " + shellQuote(dst)
+	out, err := session.CombinedOutput(cmd)
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			return fmt.Errorf("cp: %w", err)
+		}
+		return fmt.Errorf("cp: %s", msg)
+	}
+	return nil
+}
+
+// shellQuote wraps s in single quotes, escaping any embedded single quotes.
+// Safe against arbitrary user-provided paths going into a remote shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // ReadFileChunk reads up to maxBytes from remotePath. truncated is true when
 // the file is larger than maxBytes. Used for in-app preview.
 func (c *Client) ReadFileChunk(remotePath string, maxBytes int64) (data []byte, truncated bool, err error) {
@@ -773,11 +1240,49 @@ func (c *Client) ReadFileChunk(remotePath string, maxBytes int64) (data []byte, 
 	return buf, truncated, nil
 }
 
+// ReadFileRange reads up to maxBytes from remotePath starting at offset and
+// returns the total file size so the caller can detect EOF. Used by preview
+// paging to fetch further chunks on demand.
+func (c *Client) ReadFileRange(remotePath string, offset, maxBytes int64) (data []byte, total int64, err error) {
+	src, err := c.sftp.Open(remotePath)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer src.Close()
+	stat, err := src.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	total = stat.Size()
+	if offset >= total {
+		return nil, total, nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = 256 * 1024
+	}
+	if _, err := src.Seek(offset, io.SeekStart); err != nil {
+		return nil, total, err
+	}
+	remaining := total - offset
+	n := maxBytes
+	if remaining < n {
+		n = remaining
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(src, buf); err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, total, err
+	}
+	return buf, total, nil
+}
+
 // UploadProgress mirrors DownloadProgress but for the upload direction.
 type UploadProgress struct {
-	Written int64
-	Total   int64
-	File    string
+	Written    int64
+	Total      int64
+	File       string
+	ScanFile   string
+	FilesDone  int64
+	FilesTotal int64
 }
 
 // progressReader wraps a local reader and emits throttled progress callbacks
@@ -828,6 +1333,330 @@ func (c *Client) UploadFile(localPath, remotePath string, progress func(UploadPr
 	}
 	if _, err := dst.ReadFrom(pr); err != nil {
 		return fmt.Errorf("upload %s: %w", localPath, err)
+	}
+	if progress != nil {
+		progress(UploadProgress{Written: pr.written, Total: pr.total, File: remotePath})
+	}
+	return nil
+}
+
+// UploadItem describes a single upload target.
+type UploadItem struct {
+	LocalPath  string
+	RemotePath string
+	IsDir      bool
+}
+
+type uploadFileTask struct {
+	local  string
+	remote string
+	size   int64
+}
+
+// UploadBatch uploads many files (and/or directory trees) in parallel using
+// the same worker-pool pattern as DownloadBatch. The pre-scan phase walks
+// local directories, builds a flat task list and aggregates byte totals, then
+// `Parallel` workers (each with its own SFTP session) consume the queue.
+func (c *Client) UploadBatch(items []UploadItem, opts BatchOptions, progress func(UploadProgress), onFailure FailureCallback) error {
+	parallel := opts.Parallel
+	if parallel <= 0 {
+		parallel = 4
+	}
+	if parallel > 32 {
+		parallel = 32
+	}
+
+	var aborted atomic.Bool
+	var failureMu sync.Mutex
+	handleFailure := func(p string, err error) FailureDecision {
+		if aborted.Load() {
+			return DecisionAbort
+		}
+		if onFailure == nil {
+			aborted.Store(true)
+			return DecisionAbort
+		}
+		failureMu.Lock()
+		defer failureMu.Unlock()
+		if aborted.Load() {
+			return DecisionAbort
+		}
+		d := onFailure(p, err)
+		if d == DecisionAbort {
+			aborted.Store(true)
+		}
+		return d
+	}
+
+	var tasks []uploadFileTask
+	var remoteDirs []string
+	seenDir := make(map[string]bool)
+	var totalBytes int64
+
+	var lastScanEmit time.Time
+	emitScan := func(p string) {
+		if progress == nil || time.Since(lastScanEmit) < 50*time.Millisecond {
+			return
+		}
+		lastScanEmit = time.Now()
+		progress(UploadProgress{ScanFile: p, FilesTotal: int64(len(tasks)), Total: totalBytes})
+	}
+
+	addRemoteDir := func(p string) {
+		if p == "" || p == "." || p == "/" || seenDir[p] {
+			return
+		}
+		seenDir[p] = true
+		remoteDirs = append(remoteDirs, p)
+	}
+
+	var walkLocal func(local, remote string)
+	walkLocal = func(local, remote string) {
+		if aborted.Load() {
+			return
+		}
+		if progress != nil {
+			progress(UploadProgress{ScanFile: local + "/"})
+		}
+		addRemoteDir(remote)
+		entries, err := os.ReadDir(local)
+		if err != nil {
+			handleFailure(local, err)
+			return
+		}
+		for _, e := range entries {
+			if aborted.Load() {
+				return
+			}
+			localChild := filepath.Join(local, e.Name())
+			remoteChild := path.Join(remote, e.Name())
+			info, err := e.Info()
+			if err != nil {
+				handleFailure(localChild, err)
+				continue
+			}
+			// Skip symlinks to avoid following loops / unintended targets.
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if e.IsDir() {
+				walkLocal(localChild, remoteChild)
+			} else {
+				totalBytes += info.Size()
+				tasks = append(tasks, uploadFileTask{local: localChild, remote: remoteChild, size: info.Size()})
+				emitScan(localChild)
+			}
+		}
+	}
+
+	for _, item := range items {
+		if aborted.Load() {
+			break
+		}
+		if item.IsDir {
+			walkLocal(item.LocalPath, item.RemotePath)
+			continue
+		}
+		info, err := os.Stat(item.LocalPath)
+		if err != nil {
+			handleFailure(item.LocalPath, err)
+			continue
+		}
+		totalBytes += info.Size()
+		tasks = append(tasks, uploadFileTask{local: item.LocalPath, remote: item.RemotePath, size: info.Size()})
+		addRemoteDir(path.Dir(item.RemotePath))
+		emitScan(item.LocalPath)
+	}
+
+	if aborted.Load() || len(tasks) == 0 {
+		return nil
+	}
+
+	// Pre-create remote directory tree once (sequential, cheap relative to data).
+	for _, d := range remoteDirs {
+		if err := c.sftp.MkdirAll(d); err != nil {
+			handleFailure(d, err)
+			if aborted.Load() {
+				return nil
+			}
+		}
+	}
+
+	taskCh := make(chan uploadFileTask, len(tasks))
+	for _, t := range tasks {
+		taskCh <- t
+	}
+	close(taskCh)
+
+	var (
+		written     atomic.Int64
+		filesDone   atomic.Int64
+		lastEmit    atomic.Int64
+		currentFile atomic.Value
+	)
+	currentFile.Store("")
+	filesTotal := int64(len(tasks))
+	emitNow := func() {
+		if progress == nil {
+			return
+		}
+		cur, _ := currentFile.Load().(string)
+		progress(UploadProgress{
+			Written:    written.Load(),
+			Total:      totalBytes,
+			File:       cur,
+			FilesDone:  filesDone.Load(),
+			FilesTotal: filesTotal,
+		})
+	}
+	maybeEmit := func() {
+		now := time.Now().UnixNano()
+		last := lastEmit.Load()
+		if now-last < int64(50*time.Millisecond) {
+			return
+		}
+		if !lastEmit.CompareAndSwap(last, now) {
+			return
+		}
+		emitNow()
+	}
+	forceEmit := func() {
+		lastEmit.Store(time.Now().UnixNano())
+		emitNow()
+	}
+
+	var overwriteMu sync.Mutex
+	checkOverwriteRemote := func(sc *sftp.Client, remotePath string, newSize int64) OverwriteDecision {
+		if opts.OnOverwrite == nil {
+			return OverwriteReplace
+		}
+		info, err := sc.Stat(remotePath)
+		if err != nil {
+			return OverwriteReplace
+		}
+		if info.IsDir() {
+			return OverwriteSkip
+		}
+		overwriteMu.Lock()
+		defer overwriteMu.Unlock()
+		if aborted.Load() {
+			return OverwriteAbort
+		}
+		d := opts.OnOverwrite(remotePath, info.Size(), newSize)
+		if d == OverwriteAbort {
+			aborted.Store(true)
+		}
+		return d
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < parallel; i++ {
+		wg.Go(func() {
+			sc, release, err := c.AcquireSession()
+			if err != nil {
+				sc = c.sftp
+			} else {
+				defer release()
+			}
+			for t := range taskCh {
+				if aborted.Load() {
+					continue
+				}
+				var resumeOffset int64
+				switch checkOverwriteRemote(sc, t.remote, t.size) {
+				case OverwriteSkip:
+					written.Add(t.size)
+					filesDone.Add(1)
+					currentFile.Store(t.remote)
+					forceEmit()
+					continue
+				case OverwriteAbort:
+					continue
+				case OverwriteResume:
+					if info, err := sc.Stat(t.remote); err == nil {
+						resumeOffset = info.Size()
+						written.Add(resumeOffset)
+					}
+				}
+				sentSoFar := resumeOffset
+				fileProgress := func(p UploadProgress) {
+					if p.Written > sentSoFar {
+						written.Add(p.Written - sentSoFar)
+						sentSoFar = p.Written
+					}
+					currentFile.Store(t.remote)
+					maybeEmit()
+				}
+				if err := uploadFileWith(sc, t.local, t.remote, resumeOffset, fileProgress); err != nil {
+					handleFailure(t.local, err)
+					continue
+				}
+				if opts.Verify {
+					if err := c.verifyUploaded(t.local, t.remote); err != nil {
+						handleFailure(t.local, err)
+					}
+				}
+				filesDone.Add(1)
+				currentFile.Store(t.remote)
+				forceEmit()
+			}
+		})
+	}
+	wg.Wait()
+
+	if progress != nil {
+		currentFile.Store("")
+		forceEmit()
+	}
+	return nil
+}
+
+func uploadFileWith(sc *sftp.Client, localPath, remotePath string, startOffset int64, progress func(UploadProgress)) error {
+	src, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open local %s: %w", localPath, err)
+	}
+	defer src.Close()
+	stat, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local %s: %w", localPath, err)
+	}
+	var dst *sftp.File
+	if startOffset > 0 {
+		dst, err = sc.OpenFile(remotePath, os.O_WRONLY)
+		if err != nil {
+			return fmt.Errorf("open remote %s for resume: %w", remotePath, err)
+		}
+		if _, err := dst.Seek(startOffset, io.SeekStart); err != nil {
+			dst.Close()
+			return fmt.Errorf("seek remote %s: %w", remotePath, err)
+		}
+		if _, err := src.Seek(startOffset, io.SeekStart); err != nil {
+			dst.Close()
+			return fmt.Errorf("seek local %s: %w", localPath, err)
+		}
+	} else {
+		dst, err = sc.Create(remotePath)
+		if err != nil {
+			return fmt.Errorf("create remote %s: %w", remotePath, err)
+		}
+	}
+	defer dst.Close()
+	pr := &progressReader{
+		src:      src,
+		written:  startOffset,
+		total:    stat.Size(),
+		file:     remotePath,
+		progress: progress,
+	}
+	if startOffset > 0 {
+		if _, err := io.Copy(dst, pr); err != nil {
+			return fmt.Errorf("upload %s: %w", localPath, err)
+		}
+	} else {
+		if _, err := dst.ReadFrom(pr); err != nil {
+			return fmt.Errorf("upload %s: %w", localPath, err)
+		}
 	}
 	if progress != nil {
 		progress(UploadProgress{Written: pr.written, Total: pr.total, File: remotePath})

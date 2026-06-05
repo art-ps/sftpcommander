@@ -3,9 +3,11 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
-	"sftpbrowser/internal/config"
-	sftpclient "sftpbrowser/internal/sftp"
+	"github.com/art-ps/sftpcommander/internal/config"
+	sftpclient "github.com/art-ps/sftpcommander/internal/sftp"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -23,6 +25,8 @@ const (
 	viewBookmarks
 	viewHostPrompt
 	viewPassphrase
+	viewEdit
+	viewErrLog
 )
 
 type connectedMsg struct {
@@ -47,6 +51,9 @@ type App struct {
 	bookmarks   BookmarksModel
 	hostPrompt  HostPromptModel
 	passphrase  PassphraseModel
+	edit        EditModel
+	errLogView  ErrLogModel
+	errLog      []errLogEntry
 	pendingConn *ConnectedMsg
 	width       int
 	height      int
@@ -63,6 +70,7 @@ type App struct {
 
 	// Last successful connection — used by bookmarks scoping.
 	lastHost string
+	lastPort string
 	lastUser string
 }
 
@@ -76,16 +84,59 @@ func NewApp() App {
 
 func (a App) Init() tea.Cmd { return a.connList.Init() }
 
+func (a *App) pushErr(src, msg string) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	a.errLog = append(a.errLog, errLogEntry{ts: time.Now(), src: src, msg: msg})
+	if len(a.errLog) > errLogCap {
+		a.errLog = a.errLog[len(a.errLog)-errLogCap:]
+	}
+}
+
 func connectCmd(msg ConnectedMsg) tea.Cmd {
 	return func() tea.Msg {
-		client, err := sftpclient.Connect(msg.Host, msg.Port, msg.User, msg.Password, msg.KeyPath, msg.KeyPassphrase)
+		client, err := sftpclient.ConnectWithProxy(msg.Host, msg.Port, msg.User, msg.Password, msg.KeyPath, msg.KeyPassphrase, msg.ProxyJump)
 		connInfo := fmt.Sprintf("%s@%s:%s", msg.User, msg.Host, msg.Port)
+		if msg.ProxyJump != "" {
+			connInfo += " via " + msg.ProxyJump
+		}
 		return connectedMsg{client: client, connInfo: connInfo, err: err}
 	}
 }
 
 func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Observe known error-bearing messages BEFORE dispatch so they land in the
+	// error ring even when handled by a sub-model below.
+	switch m := msg.(type) {
+	case opDoneMsg:
+		if m.err != nil {
+			a.pushErr("op:"+m.op, m.err.Error())
+		}
+	case entriesLoadedMsg:
+		if m.err != nil {
+			a.pushErr("list", m.path+": "+m.err.Error())
+		}
+	case findResultsMsg:
+		if m.err != nil {
+			a.pushErr("find", m.err.Error())
+		}
+	}
+
 	switch msg := msg.(type) {
+	case errReportMsg:
+		a.pushErr(msg.src, msg.msg)
+		return a, nil
+	case openErrLogMsg:
+		a.errLogView = NewErrLogModel(a.errLog)
+		a.prevView = a.current
+		a.current = viewErrLog
+		a.errLogView, _ = updateAs(a.errLogView, tea.WindowSizeMsg{Width: a.width, Height: a.height})
+		return a, nil
+	case backFromErrLogMsg:
+		a.current = a.returnView()
+		return a, nil
 	case tea.WindowSizeMsg:
 		a.width = msg.Width
 		a.height = msg.Height
@@ -103,6 +154,8 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.bookmarks, _ = updateAs[BookmarksModel](a.bookmarks, msg)
 		a.hostPrompt, _ = updateAs[HostPromptModel](a.hostPrompt, msg)
 		a.passphrase, _ = updateAs[PassphraseModel](a.passphrase, msg)
+		a.edit, _ = updateAs[EditModel](a.edit, msg)
+		a.errLogView, _ = updateAs[ErrLogModel](a.errLogView, msg)
 		return a, cmd
 
 	case openConnectFormMsg:
@@ -161,6 +214,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if a.pendingConn != nil {
 			a.lastHost = a.pendingConn.Host
+			a.lastPort = a.pendingConn.Port
 			a.lastUser = a.pendingConn.User
 			// Auto-save successful connection (deduped by name in store).
 			_ = config.AddConnection(config.Connection{
@@ -173,11 +227,14 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		a.pendingConn = nil
 		a.client = msg.client
-		a.browser = NewBrowserModel(NewRemoteFS(msg.client, msg.connInfo))
-		a.current = viewBrowser
-		// Re-send window size so browser computes its layout.
+		remoteFS := NewCachedFS(NewRemoteFS(msg.client, msg.connInfo))
+		a.browser = NewBrowserModel(remoteFS)
+		a.twoPane = NewTwoPaneModel(msg.client, NewCachedFS(NewLocalFS()), remoteFS)
+		a.current = viewTwoPane
+		// Re-send window size so both views compute their layout.
 		a.browser, _ = updateAs[BrowserModel](a.browser, tea.WindowSizeMsg{Width: a.width, Height: a.height})
-		return a, a.browser.Init()
+		a.twoPane, _ = updateAs[TwoPaneModel](a.twoPane, tea.WindowSizeMsg{Width: a.width, Height: a.height})
+		return a, tea.Batch(a.browser.Init(), a.twoPane.Init())
 
 	case passphraseEnteredMsg:
 		if a.pendingConn == nil {
@@ -250,8 +307,26 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.preview, _ = updateAs[PreviewModel](a.preview, tea.WindowSizeMsg{Width: a.width, Height: a.height})
 		return a, a.preview.Init()
 
+	case editStartMsg:
+		fs := msg.fs
+		if fs == nil {
+			fs = a.browser.fs
+		}
+		a.edit = NewEditModel(fs, msg.entry)
+		a.prevView = a.current
+		a.current = viewEdit
+		a.edit, _ = updateAs[EditModel](a.edit, tea.WindowSizeMsg{Width: a.width, Height: a.height})
+		return a, a.edit.Init()
+
+	case backFromEditMsg:
+		a.current = a.returnView()
+		if a.current == viewTwoPane {
+			return a, func() tea.Msg { return refreshTwoPaneMsg{} }
+		}
+		return a, a.browser.Refresh()
+
 	case openTwoPaneMsg:
-		a.twoPane = NewTwoPaneModel(a.client, NewLocalFS(), NewRemoteFS(a.client, a.browser.fs.Label()))
+		a.twoPane = NewTwoPaneModel(a.client, NewCachedFS(NewLocalFS()), NewCachedFS(NewRemoteFS(a.client, a.browser.fs.Label())))
 		a.current = viewTwoPane
 		a.twoPane, _ = updateAs[TwoPaneModel](a.twoPane, tea.WindowSizeMsg{Width: a.width, Height: a.height})
 		return a, a.twoPane.Init()
@@ -261,7 +336,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case openBookmarksMsg:
-		a.bookmarks = NewBookmarksModel(a.lastHost, a.lastUser)
+		a.bookmarks = NewBookmarksModel(a.lastHost, a.lastPort, a.lastUser)
 		a.current = viewBookmarks
 		a.bookmarks, _ = updateAs[BookmarksModel](a.bookmarks, tea.WindowSizeMsg{Width: a.width, Height: a.height})
 		return a, nil
@@ -269,6 +344,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case addBookmarkMsg:
 		_ = config.AddBookmark(config.Bookmark{
 			Host: a.lastHost,
+			Port: a.lastPort,
 			User: a.lastUser,
 			Path: msg.path,
 		})
@@ -341,6 +417,14 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		a.passphrase, cmd = updateAs[PassphraseModel](a.passphrase, msg)
 		return a, cmd
+	case viewEdit:
+		var cmd tea.Cmd
+		a.edit, cmd = updateAs[EditModel](a.edit, msg)
+		return a, cmd
+	case viewErrLog:
+		var cmd tea.Cmd
+		a.errLogView, cmd = updateAs[ErrLogModel](a.errLogView, msg)
+		return a, cmd
 	}
 	return a, nil
 }
@@ -367,6 +451,10 @@ func (a App) View() string {
 		return a.hostPrompt.View()
 	case viewPassphrase:
 		return a.passphrase.View()
+	case viewEdit:
+		return a.edit.View()
+	case viewErrLog:
+		return a.errLogView.View()
 	}
 	return ""
 }

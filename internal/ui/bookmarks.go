@@ -1,7 +1,7 @@
 package ui
 
 import (
-	"sftpbrowser/internal/config"
+	"github.com/art-ps/sftpcommander/internal/config"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -12,6 +12,7 @@ type backFromBookmarksMsg struct{}
 
 type BookmarksModel struct {
 	host    string
+	port    string
 	user    string
 	items   []config.Bookmark
 	cursor  int
@@ -20,14 +21,14 @@ type BookmarksModel struct {
 	height  int
 }
 
-func NewBookmarksModel(host, user string) BookmarksModel {
-	m := BookmarksModel{host: host, user: user}
+func NewBookmarksModel(host, port, user string) BookmarksModel {
+	m := BookmarksModel{host: host, port: port, user: user}
 	m.reload()
 	return m
 }
 
 func (m *BookmarksModel) reload() {
-	items, err := config.BookmarksForHost(m.host, m.user)
+	items, err := config.BookmarksForHost(m.host, m.port, m.user)
 	if err != nil {
 		m.err = err.Error()
 		return
@@ -67,7 +68,7 @@ func (m BookmarksModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			b := m.items[m.cursor]
-			if err := config.DeleteBookmark(b.Host, b.User, b.Path); err != nil {
+			if err := config.DeleteBookmark(b.Host, b.Port, b.User, b.Path); err != nil {
 				m.err = err.Error()
 			}
 			m.reload()

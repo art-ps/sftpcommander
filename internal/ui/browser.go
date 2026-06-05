@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	sftpclient "sftpbrowser/internal/sftp"
+	sftpclient "github.com/art-ps/sftpcommander/internal/sftp"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -43,6 +44,11 @@ type previewStartMsg struct {
 	fs    FileSystem
 }
 
+type editStartMsg struct {
+	entry sftpclient.FileEntry
+	fs    FileSystem
+}
+
 type openBookmarksMsg struct{}
 type addBookmarkMsg struct{ path string }
 type openTwoPaneMsg struct{}
@@ -55,6 +61,7 @@ const (
 	modePrompt
 	modeConfirm
 	modeHelp
+	modeFindInput
 )
 
 type promptKind int
@@ -63,6 +70,8 @@ const (
 	promptRename promptKind = iota
 	promptMkdir
 	promptChmod
+	promptChmodRecursive
+	promptCopy
 )
 
 type sortMode int
@@ -96,12 +105,30 @@ type opDoneMsg struct {
 	side   int
 }
 
+type symlinkResolvedMsg struct {
+	path   string
+	target string
+	side   int
+}
+
+// findResultsMsg delivers the result of an async recursive walk back to the
+// originating browser side. err is set on the first I/O error encountered;
+// partial results are still returned so the user sees what was found.
+type findResultsMsg struct {
+	root    string
+	pattern string
+	entries []sftpclient.FileEntry
+	err     error
+	side    int
+}
+
 type BrowserModel struct {
 	fs        FileSystem
 	side      int // identifier so two-pane mode can route async msgs back
 	path      string
-	entries   []sftpclient.FileEntry // raw from fs
-	visible   []sftpclient.FileEntry // filtered+sorted view
+	entries       []sftpclient.FileEntry // raw from fs
+	sortedEntries []sftpclient.FileEntry // entries sorted by current sortBy/sortDesc (cache)
+	visible       []sftpclient.FileEntry // filtered subset of sortedEntries (buffer reused)
 	cursor    int
 	offset    int
 	loading   bool
@@ -131,6 +158,23 @@ type BrowserModel struct {
 	// default chrome. Used by TwoPane to mark the focused panel.
 	twoPane bool
 	focused bool
+
+	// Recursive find state. findActive replaces m.entries with results
+	// collected by a tree walk; findRoot remembers the directory we walked
+	// from so esc/R can return to that listing. findInput is the modal input
+	// shown while modeFindInput is active.
+	findActive   bool
+	findRoot     string
+	findInput    textinput.Model
+	pendingFocus string // basename to focus after next loadDir completes
+
+	helpOffset int
+
+	// symlinkTargets caches Readlink results so cursor movement doesn't fire
+	// a network round-trip on every keystroke. Empty value means "tried,
+	// failed" — used as a negative cache so retries don't loop.
+	symlinkTargets map[string]string
+	symlinkPending map[string]bool
 }
 
 func NewBrowserModel(fs FileSystem) BrowserModel {
@@ -151,15 +195,23 @@ func NewBrowserModelSide(fs FileSystem, side int) BrowserModel {
 	prompt.Prompt = ""
 	prompt.Width = 48
 
+	find := textinput.New()
+	find.CharLimit = 256
+	find.Prompt = ""
+	find.Width = 48
+
 	return BrowserModel{
-		fs:          fs,
-		side:        side,
-		path:        fs.Home(),
-		loading:     true,
-		selection:   make(map[string]bool),
-		cursorMem:   make(map[string]cursorState),
-		filterInput: filter,
-		promptInput: prompt,
+		fs:             fs,
+		side:           side,
+		path:           fs.Home(),
+		loading:        true,
+		selection:      make(map[string]bool),
+		cursorMem:      make(map[string]cursorState),
+		filterInput:    filter,
+		promptInput:    prompt,
+		findInput:      find,
+		symlinkTargets: make(map[string]string),
+		symlinkPending: make(map[string]bool),
 	}
 }
 
@@ -182,6 +234,9 @@ func (m BrowserModel) loadDir(p string) tea.Cmd {
 }
 
 func (m BrowserModel) Refresh() tea.Cmd {
+	if inv, ok := m.fs.(interface{ Invalidate(string) }); ok {
+		inv.Invalidate(m.path)
+	}
 	return m.loadDir(m.path)
 }
 
@@ -206,20 +261,31 @@ func (m BrowserModel) visibleRows() int {
 	return 3
 }
 
+// rebuildSorted refreshes the sortedEntries cache from m.entries using the
+// current sort mode/direction. Called when entries change or sort changes;
+// applyView only reads from this cache.
+func (m *BrowserModel) rebuildSorted() {
+	if cap(m.sortedEntries) >= len(m.entries) {
+		m.sortedEntries = m.sortedEntries[:len(m.entries)]
+	} else {
+		m.sortedEntries = make([]sftpclient.FileEntry, len(m.entries))
+	}
+	copy(m.sortedEntries, m.entries)
+	sortEntries(m.sortedEntries, m.sortBy, m.sortDesc)
+}
+
 func (m *BrowserModel) applyView() {
-	visible := make([]sftpclient.FileEntry, 0, len(m.entries))
-	filter := strings.ToLower(strings.TrimSpace(m.filterInput.Value()))
-	for _, e := range m.entries {
+	match := compileFilter(m.filterInput.Value())
+	m.visible = m.visible[:0]
+	for _, e := range m.sortedEntries {
 		if !m.showHidden && strings.HasPrefix(e.Name, ".") {
 			continue
 		}
-		if filter != "" && !strings.Contains(strings.ToLower(e.Name), filter) {
+		if !match(e.Name) {
 			continue
 		}
-		visible = append(visible, e)
+		m.visible = append(m.visible, e)
 	}
-	sortEntries(visible, m.sortBy, m.sortDesc)
-	m.visible = visible
 	if m.cursor >= len(m.visible) {
 		m.cursor = 0
 		if len(m.visible) > 0 {
@@ -228,6 +294,45 @@ func (m *BrowserModel) applyView() {
 	}
 	if m.offset > m.cursor {
 		m.offset = m.cursor
+	}
+}
+
+// compileFilter returns a name-match predicate from the user's filter string.
+// Recognised forms:
+//   - "re:PATTERN"       — Go regexp, case-insensitive, anchored loosely (any
+//                          match counts; use ^/$ for anchoring).
+//   - contains * or ?    — glob via path.Match against the basename.
+//   - anything else      — case-insensitive substring match.
+// An invalid regex/glob falls back to literal substring matching so the user
+// keeps seeing results while typing.
+func compileFilter(raw string) func(string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return func(string) bool { return true }
+	}
+	if pat, ok := strings.CutPrefix(s, "re:"); ok {
+		re, err := regexp.Compile("(?i)" + pat)
+		if err != nil {
+			lower := strings.ToLower(s)
+			return func(name string) bool {
+				return strings.Contains(strings.ToLower(name), lower)
+			}
+		}
+		return func(name string) bool { return re.MatchString(name) }
+	}
+	if strings.ContainsAny(s, "*?[") {
+		lower := strings.ToLower(s)
+		return func(name string) bool {
+			ok, err := path.Match(lower, strings.ToLower(name))
+			if err != nil {
+				return strings.Contains(strings.ToLower(name), lower)
+			}
+			return ok
+		}
+	}
+	lower := strings.ToLower(s)
+	return func(name string) bool {
+		return strings.Contains(strings.ToLower(name), lower)
 	}
 }
 
@@ -264,6 +369,9 @@ func (m BrowserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.loading = true
+		if inv, ok := m.fs.(interface{ Invalidate(string) }); ok {
+			inv.Invalidate(m.path)
+		}
 		return m, m.loadDir(m.path)
 
 	case entriesLoadedMsg:
@@ -274,18 +382,47 @@ func (m BrowserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.err = msg.err.Error()
 		} else {
+			if msg.path != m.path && m.filterInput.Value() != "" {
+				m.filterInput.SetValue("")
+			}
 			m.path = msg.path
 			m.entries = msg.entries
 			m.err = ""
+			m.rebuildSorted()
 			m.applyView()
-			if cs, ok := m.cursorMem[m.path]; ok && cs.cursor < len(m.visible) {
-				m.cursor = cs.cursor
-				m.offset = min(cs.offset, m.cursor)
-			} else {
+			switch {
+			case m.pendingFocus != "":
 				m.cursor = 0
 				m.offset = 0
+				for i, e := range m.visible {
+					if e.Name == m.pendingFocus {
+						m.cursor = i
+						vis := m.visibleRows()
+						if m.cursor >= vis {
+							m.offset = m.cursor - vis + 1
+						}
+						break
+					}
+				}
+				m.pendingFocus = ""
+			default:
+				if cs, ok := m.cursorMem[m.path]; ok && cs.cursor < len(m.visible) {
+					m.cursor = cs.cursor
+					m.offset = min(cs.offset, m.cursor)
+				} else {
+					m.cursor = 0
+					m.offset = 0
+				}
 			}
 		}
+		return m, m.maybeResolveSymlink()
+
+	case symlinkResolvedMsg:
+		if msg.side != m.side {
+			return m, nil
+		}
+		delete(m.symlinkPending, msg.path)
+		m.symlinkTargets[msg.path] = msg.target
 		return m, nil
 
 	case opDoneMsg:
@@ -299,7 +436,35 @@ func (m BrowserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = fmt.Sprintf("%s ok", msg.op)
 		m.selection = make(map[string]bool)
 		m.loading = true
+		// Most ops route through the FS interface and CachedFS already
+		// invalidated the parent dir. CopyRemote bypasses that path, so
+		// invalidate m.path defensively before reloading.
+		if inv, ok := m.fs.(interface{ Invalidate(string) }); ok {
+			inv.Invalidate(m.path)
+		}
 		return m, m.loadDir(m.path)
+
+	case findResultsMsg:
+		if msg.side != m.side {
+			return m, nil
+		}
+		m.loading = false
+		if msg.err != nil {
+			m.err = "find: " + msg.err.Error()
+		}
+		m.findActive = true
+		m.findRoot = msg.root
+		m.entries = msg.entries
+		m.rebuildSorted()
+		m.applyView()
+		m.cursor = 0
+		m.offset = 0
+		if len(m.visible) == 0 && msg.err == nil {
+			m.status = "no matches for " + msg.pattern
+		} else if msg.err == nil {
+			m.status = fmt.Sprintf("found %d in %s", len(m.visible), msg.root)
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		switch m.mode {
@@ -311,15 +476,44 @@ func (m BrowserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirm(msg)
 		case modeHelp:
 			return m.updateHelp(msg)
+		case modeFindInput:
+			return m.updateFindInput(msg)
 		}
 		return m.updateBrowse(msg)
 	}
 	return m, nil
 }
 
+// maybeResolveSymlink dispatches a Readlink for the entry under the cursor
+// when it's a symlink we haven't resolved yet. Returns nil if no work needed.
+func (m *BrowserModel) maybeResolveSymlink() tea.Cmd {
+	if m.cursor < 0 || m.cursor >= len(m.visible) {
+		return nil
+	}
+	e := m.visible[m.cursor]
+	if !e.IsSymlink {
+		return nil
+	}
+	if _, ok := m.symlinkTargets[e.Path]; ok {
+		return nil
+	}
+	if m.symlinkPending[e.Path] {
+		return nil
+	}
+	m.symlinkPending[e.Path] = true
+	fs := m.fs
+	side := m.side
+	p := e.Path
+	return func() tea.Msg {
+		target, err := fs.Readlink(p)
+		if err != nil {
+			target = ""
+		}
+		return symlinkResolvedMsg{path: p, target: target, side: side}
+	}
+}
+
 func (m BrowserModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	m.err = ""
-	m.status = ""
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -377,13 +571,25 @@ func (m BrowserModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			break
 		}
 		entry := m.visible[m.cursor]
+		if m.findActive {
+			// Jump to the entry's directory: cd to parent and position cursor
+			// on the basename. For directories themselves, cd into them.
+			m.findActive = false
+			m.findRoot = ""
+			m.loading = true
+			if entry.IsDir {
+				return m, m.loadDir(entry.Path)
+			}
+			m.pendingFocus = m.fs.Base(entry.Path)
+			return m, m.loadDir(m.fs.Dir(entry.Path))
+		}
 		if entry.IsDir {
 			m.cursorMem[m.path] = cursorState{m.cursor, m.offset}
 			m.loading = true
 			return m, m.loadDir(entry.Path)
 		}
 		fs := m.fs
-			return m, func() tea.Msg { return previewStartMsg{entry: entry, fs: fs} }
+		return m, func() tea.Msg { return previewStartMsg{entry: entry, fs: fs} }
 
 	case "v":
 		if len(m.visible) == 0 {
@@ -396,6 +602,9 @@ func (m BrowserModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "h", "left", "backspace":
+		if m.findActive {
+			return m, m.exitFind()
+		}
 		parent := m.fs.Dir(m.path)
 		if parent != m.path {
 			m.cursorMem[m.path] = cursorState{m.cursor, m.offset}
@@ -404,7 +613,16 @@ func (m BrowserModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "R":
+		m.selection = make(map[string]bool)
+		m.err = ""
+		m.status = ""
+		if m.findActive {
+			return m, m.exitFind()
+		}
 		m.loading = true
+		if inv, ok := m.fs.(interface{ Invalidate(string) }); ok {
+			inv.Invalidate(m.path)
+		}
 		return m, m.loadDir(m.path)
 
 	case " ":
@@ -426,8 +644,14 @@ func (m BrowserModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "esc":
-		if len(m.selection) > 0 {
+		switch {
+		case m.findActive:
+			return m, m.exitFind()
+		case len(m.selection) > 0:
 			m.selection = make(map[string]bool)
+		case m.err != "" || m.status != "":
+			m.err = ""
+			m.status = ""
 		}
 
 	case "d":
@@ -473,11 +697,22 @@ func (m BrowserModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "s":
 		m.sortBy = (m.sortBy + 1) % 3
+		m.rebuildSorted()
 		m.applyView()
 
 	case "S":
 		m.sortDesc = !m.sortDesc
+		m.rebuildSorted()
 		m.applyView()
+
+	case "F":
+		m.mode = modeFindInput
+		m.findInput.SetValue("")
+		m.findInput.Focus()
+		return m, textinput.Blink
+
+	case "E":
+		return m, func() tea.Msg { return openErrLogMsg{} }
 
 	case "?":
 		m.mode = modeHelp
@@ -529,8 +764,36 @@ func (m BrowserModel) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		mode := fmt.Sprintf("%o", entry.Mode.Perm())
 		m.openPrompt(promptChmod, entry.Path, "Mode (octal):", mode)
 		return m, textinput.Blink
+
+	case "C":
+		if len(m.visible) == 0 {
+			break
+		}
+		entry := m.visible[m.cursor]
+		mode := fmt.Sprintf("%o", entry.Mode.Perm())
+		m.openPrompt(promptChmodRecursive, entry.Path, "Mode (octal, recursive):", mode)
+		return m, textinput.Blink
+
+	case "f5":
+		if m.fs.Kind() != "remote" || len(m.visible) == 0 {
+			break
+		}
+		entry := m.visible[m.cursor]
+		m.openPrompt(promptCopy, entry.Path, "Copy to (path):", m.fs.Join(m.fs.Dir(entry.Path), entry.Name+".copy"))
+		return m, textinput.Blink
+
+	case "e":
+		if m.fs.Kind() != "remote" || len(m.visible) == 0 {
+			break
+		}
+		entry := m.visible[m.cursor]
+		if entry.IsDir || entry.IsSymlink {
+			break
+		}
+		fs := m.fs
+		return m, func() tea.Msg { return editStartMsg{entry: entry, fs: fs} }
 	}
-	return m, nil
+	return m, m.maybeResolveSymlink()
 }
 
 func (m *BrowserModel) openPrompt(kind promptKind, target, label, initial string) {
@@ -541,6 +804,94 @@ func (m *BrowserModel) openPrompt(kind promptKind, target, label, initial string
 	m.promptInput.SetValue(initial)
 	m.promptInput.CursorEnd()
 	m.promptInput.Focus()
+}
+
+func (m BrowserModel) updateFindInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.findInput.Blur()
+		m.mode = modeBrowse
+		return m, nil
+	case "enter":
+		pattern := strings.TrimSpace(m.findInput.Value())
+		m.findInput.Blur()
+		m.mode = modeBrowse
+		if pattern == "" {
+			return m, nil
+		}
+		m.loading = true
+		m.status = "searching " + m.path + "..."
+		return m, m.runFind(m.path, pattern)
+	}
+	var cmd tea.Cmd
+	m.findInput, cmd = m.findInput.Update(msg)
+	return m, cmd
+}
+
+// runFind walks the directory tree under root looking for entries whose name
+// matches pattern (parsed by compileFilter — so re:/glob/substring all work).
+// Found entries get their Name rewritten to the path relative to root so the
+// list view shows context. Path stays absolute for ops.
+func (m BrowserModel) runFind(root, pattern string) tea.Cmd {
+	fs := m.fs
+	side := m.side
+	match := compileFilter(pattern)
+	const limit = 5000
+	return func() tea.Msg {
+		var (
+			results []sftpclient.FileEntry
+			firstErr error
+		)
+		var walk func(dir string)
+		walk = func(dir string) {
+			if firstErr != nil || len(results) >= limit {
+				return
+			}
+			entries, err := fs.List(dir)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s: %w", dir, err)
+				}
+				return
+			}
+			for _, e := range entries {
+				if match(e.Name) {
+					display := strings.TrimPrefix(e.Path, root)
+					display = strings.TrimPrefix(display, "/")
+					if display == "" {
+						display = e.Name
+					}
+					hit := e
+					hit.Name = display
+					results = append(results, hit)
+					if len(results) >= limit {
+						return
+					}
+				}
+				if e.IsDir && !e.IsSymlink {
+					walk(e.Path)
+				}
+			}
+		}
+		walk(root)
+		return findResultsMsg{root: root, pattern: pattern, entries: results, err: firstErr, side: side}
+	}
+}
+
+// exitFind clears recursive-find state and reloads the original path. Called
+// from R/esc/cd-up in browse mode.
+func (m *BrowserModel) exitFind() tea.Cmd {
+	if !m.findActive {
+		return nil
+	}
+	m.findActive = false
+	root := m.findRoot
+	m.findRoot = ""
+	m.entries = nil
+	m.rebuildSorted()
+	m.applyView()
+	m.loading = true
+	return m.loadDir(root)
 }
 
 func (m BrowserModel) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -603,6 +954,22 @@ func (m BrowserModel) runPrompt(value string) tea.Cmd {
 				return opDoneMsg{op: "chmod", target: target, err: fmt.Errorf("invalid octal mode: %w", err), side: side}
 			}
 			return opDoneMsg{op: "chmod", target: target, err: fs.Chmod(target, os.FileMode(n)), side: side}
+		case promptChmodRecursive:
+			n, err := strconv.ParseUint(value, 8, 32)
+			if err != nil {
+				return opDoneMsg{op: "chmod -R", target: target, err: fmt.Errorf("invalid octal mode: %w", err), side: side}
+			}
+			return opDoneMsg{op: "chmod -R", target: target, err: chmodRecursive(fs, target, os.FileMode(n)), side: side}
+		case promptCopy:
+			dest := value
+			if !strings.HasPrefix(dest, "/") {
+				dest = fs.Join(fs.Dir(target), dest)
+			}
+			rfs, ok := unwrapFS(fs).(*RemoteFS)
+			if !ok {
+				return opDoneMsg{op: "copy", target: target, err: fmt.Errorf("copy only works on remote fs"), side: side}
+			}
+			return opDoneMsg{op: "copy", target: target, err: rfs.Client().CopyRemote(target, dest), side: side}
 		}
 		return opDoneMsg{op: "unknown", side: side}
 	}
@@ -637,6 +1004,24 @@ func (m BrowserModel) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "?", "esc", "q", "enter":
 		m.mode = modeBrowse
+		m.helpOffset = 0
+	case "up", "k":
+		if m.helpOffset > 0 {
+			m.helpOffset--
+		}
+	case "down", "j":
+		m.helpOffset++
+	case "pgup":
+		m.helpOffset -= 10
+		if m.helpOffset < 0 {
+			m.helpOffset = 0
+		}
+	case "pgdown":
+		m.helpOffset += 10
+	case "g":
+		m.helpOffset = 0
+	case "G":
+		m.helpOffset = 1 << 30 // clamped by view
 	}
 	return m, nil
 }
@@ -704,6 +1089,9 @@ func (m BrowserModel) View() string {
 	}
 	if m.filterInput.Value() != "" {
 		sortInd += " /" + m.filterInput.Value()
+	}
+	if m.findActive {
+		sortInd += " [find]"
 	}
 	indWidth := runewidth.StringWidth(sortInd) + 2
 	pathText := truncate(m.path, max(0, m.width-4-indWidth))
@@ -775,14 +1163,21 @@ func (m BrowserModel) View() string {
 
 			icon := fileIcon(entry)
 			trailing := 0
-			if entry.IsDir {
+			if entry.IsDir || entry.IsSymlink {
 				trailing = 1
 			}
 			name := truncate(entry.Name, nameWidth-2-trailing)
 			var nameStyled string
-			if entry.IsDir {
+			switch {
+			case entry.IsSymlink:
+				suffix := "@"
+				if entry.IsDir {
+					suffix = "/"
+				}
+				nameStyled = lipgloss.NewStyle().Foreground(colorAccent).Render(icon + " " + name + suffix)
+			case entry.IsDir:
 				nameStyled = styleDir.Render(icon + " " + name + "/")
-			} else {
+			default:
 				nameStyled = styleFile.Render(icon + " " + name)
 			}
 
@@ -828,12 +1223,40 @@ func (m BrowserModel) View() string {
 		scrollInfo = fmt.Sprintf("%d/%d", m.cursor+1, len(m.visible))
 	}
 	if len(m.selection) > 0 {
-		scrollInfo += fmt.Sprintf("  %s selected", styleStatusOk.Render(fmt.Sprintf("%d", len(m.selection))))
+		var selBytes int64
+		for _, e := range m.visible {
+			if m.selection[e.Path] && !e.IsDir {
+				selBytes += e.Size
+			}
+		}
+		scrollInfo += fmt.Sprintf("  %s selected (%s)",
+			styleStatusOk.Render(fmt.Sprintf("%d", len(m.selection))),
+			formatSize(selBytes))
+	} else if len(m.visible) > 0 {
+		var files, dirs int
+		var totalBytes int64
+		for _, e := range m.visible {
+			if e.IsDir {
+				dirs++
+			} else {
+				files++
+				totalBytes += e.Size
+			}
+		}
+		scrollInfo += fmt.Sprintf("  %dd %df %s", dirs, files, formatSize(totalBytes))
 	}
 
 	statusMsg := ""
 	if m.status != "" {
 		statusMsg = "  " + styleStatusOk.Render(m.status)
+	}
+	if statusMsg == "" && len(m.visible) > 0 && m.cursor >= 0 && m.cursor < len(m.visible) {
+		cur := m.visible[m.cursor]
+		if cur.IsSymlink {
+			if target, ok := m.symlinkTargets[cur.Path]; ok && target != "" {
+				statusMsg = "  " + lipgloss.NewStyle().Foreground(colorAccent).Render("→ "+target)
+			}
+		}
 	}
 
 	statusBar := styleStatusBar.Width(m.width).MaxHeight(1).Render(
@@ -848,6 +1271,7 @@ func (m BrowserModel) View() string {
 		keyHint("d/u", "dl/up") + "  " +
 		keyHint("D/r/M/c", "ops") + "  " +
 		keyHint("/", "filter") + "  " +
+		keyHint("F", "find") + "  " +
 		keyHint("s", "sort") + "  " +
 		keyHint("?", "help") + "  " +
 		keyHint("q", "quit")
@@ -874,8 +1298,28 @@ func (m BrowserModel) View() string {
 		return overlay(base, m.viewConfirm(), m.width, m.height)
 	case modeHelp:
 		return overlay(base, m.viewHelp(), m.width, m.height)
+	case modeFindInput:
+		return overlay(base, m.viewFindInput(), m.width, m.height)
 	}
 	return base
+}
+
+func (m BrowserModel) viewFindInput() string {
+	inputStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorPrimary).
+		Padding(0, 1)
+	body := []string{
+		lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render("Recursive find"),
+		"",
+		styleSubtitle.Render("under " + m.path),
+		"",
+		styleKeyHint.Render("pattern (substring, *.go, re:^foo)"),
+		inputStyle.Render(m.findInput.View()),
+		"",
+		"  " + keyHint("enter", "search") + "   " + keyHint("esc", "cancel"),
+	}
+	return stylePanel.Render(lipgloss.JoinVertical(lipgloss.Left, body...))
 }
 
 func (m BrowserModel) viewFilter() string {
@@ -947,13 +1391,16 @@ func (m BrowserModel) viewHelp() string {
 		{"", ""},
 		{"d", "download"},
 		{"u", "upload"},
+		{"e", "edit ($EDITOR, remote)"},
 		{"v / ↵", "preview text file"},
 		{"D", "delete (recursive)"},
 		{"r", "rename"},
+		{"F5", "copy on remote"},
 		{"M", "mkdir"},
-		{"c", "chmod (octal)"},
+		{"c / C", "chmod (single / recursive)"},
 		{"", ""},
-		{"/", "filter"},
+		{"/", "filter (re:RE, *.glob, substr)"},
+		{"F", "recursive find under cwd"},
 		{".", "toggle hidden"},
 		{"s / S", "sort mode / direction"},
 		{"", ""},
@@ -962,10 +1409,11 @@ func (m BrowserModel) viewHelp() string {
 		{"", ""},
 		{"T", "open two-pane (mc-style)"},
 		{"", ""},
+		{"E", "open error log"},
 		{"?", "this help"},
 		{"q", "quit"},
 	}
-	lines := []string{heading, ""}
+	var lines []string
 	keyStyle := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Width(14)
 	descStyle := lipgloss.NewStyle().Foreground(colorText)
 	for _, r := range rows {
@@ -975,8 +1423,37 @@ func (m BrowserModel) viewHelp() string {
 		}
 		lines = append(lines, keyStyle.Render(r[0])+descStyle.Render(r[1]))
 	}
-	lines = append(lines, "", "  "+keyHint("?/esc/q", "close"))
-	return stylePanel.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+
+	// Window: title(1) + blank(1) + body(N) + blank(1) + footer(1) + panel chrome(4).
+	bodyMax := m.height - 8
+	if bodyMax < 5 {
+		bodyMax = 5
+	}
+	maxOffset := len(lines) - bodyMax
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	offset := m.helpOffset
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	end := offset + bodyMax
+	if end > len(lines) {
+		end = len(lines)
+	}
+	body := lines[offset:end]
+
+	scrollHint := ""
+	if maxOffset > 0 {
+		scrollHint = fmt.Sprintf("  [%d-%d/%d]", offset+1, end, len(lines))
+	}
+
+	out := append([]string{heading, ""}, body...)
+	out = append(out, "", "  "+keyHint("↑↓/jk", "scroll")+
+		"   "+keyHint("g/G", "top/end")+
+		"   "+keyHint("?/esc/q", "close")+
+		scrollHint)
+	return stylePanel.Render(lipgloss.JoinVertical(lipgloss.Left, out...))
 }
 
 // overlay replaces the base view with a centered panel. Bubble Tea has no
@@ -990,7 +1467,14 @@ func styleSecondary(s string) string {
 	return lipgloss.NewStyle().Foreground(colorSecondary).Render(s)
 }
 
+// useNerdFont is decided once at startup. SFTP_NO_NF=1 forces the ASCII
+// fallback for terminals that don't have a Nerd Font configured.
+var useNerdFont = os.Getenv("SFTP_NO_NF") != "1"
+
 func fileIcon(e sftpclient.FileEntry) string {
+	if !useNerdFont {
+		return asciiFileIcon(e)
+	}
 	if e.IsDir {
 		return ""
 	}
@@ -1028,6 +1512,45 @@ func fileIcon(e sftpclient.FileEntry) string {
 		return ""
 	default:
 		return ""
+	}
+}
+
+// asciiFileIcon returns single-character category markers for terminals
+// without Nerd Font glyphs. Width is always one column so the layout math
+// in View() stays correct.
+func asciiFileIcon(e sftpclient.FileEntry) string {
+	if e.IsDir {
+		return "d"
+	}
+	if e.IsSymlink {
+		return "l"
+	}
+	ext := strings.ToLower(path.Ext(e.Name))
+	switch ext {
+	case ".go", ".py", ".js", ".ts", ".jsx", ".tsx",
+		".c", ".cpp", ".h", ".rs", ".java", ".html", ".css":
+		return "c"
+	case ".json", ".yaml", ".yml", ".toml",
+		".env", ".cfg", ".conf", ".ini":
+		return "k"
+	case ".md", ".txt", ".rst":
+		return "t"
+	case ".sh", ".bash", ".zsh":
+		return "x"
+	case ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z":
+		return "a"
+	case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp":
+		return "i"
+	case ".mp4", ".mkv", ".avi", ".mov":
+		return "v"
+	case ".mp3", ".flac", ".wav", ".ogg":
+		return "m"
+	case ".pdf":
+		return "p"
+	case ".db", ".sqlite", ".sql":
+		return "s"
+	default:
+		return "f"
 	}
 }
 

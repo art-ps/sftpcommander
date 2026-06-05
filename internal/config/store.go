@@ -1,5 +1,5 @@
 // Package config persists saved connections and bookmarks to TOML files under
-// ~/.config/sftpbrowser/. Both stores share the same load-modify-save pattern.
+// ~/.config/sftpcommander/. Both stores share the same load-modify-save pattern.
 package config
 
 import (
@@ -23,6 +23,7 @@ type connectionsFile struct {
 
 type Bookmark struct {
 	Host  string `toml:"host"`
+	Port  string `toml:"port,omitempty"`
 	User  string `toml:"user"`
 	Path  string `toml:"path"`
 	Label string `toml:"label,omitempty"`
@@ -37,7 +38,7 @@ func configDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(home, ".config", "sftpbrowser")
+	dir := filepath.Join(home, ".config", "sftpcommander")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -143,9 +144,11 @@ func SaveBookmarks(b []Bookmark) error {
 	return writeTOML(p, bookmarksFile{Bookmark: b})
 }
 
-// BookmarksForHost returns bookmarks whose host+user match. Empty host/user
-// matches everything (useful before a connection is set up).
-func BookmarksForHost(host, user string) ([]Bookmark, error) {
+// BookmarksForHost returns bookmarks whose host+port+user match. Empty
+// host/user matches everything (useful before a connection is set up). An
+// empty stored port matches any queried port (legacy entries written before
+// port scoping).
+func BookmarksForHost(host, port, user string) ([]Bookmark, error) {
 	all, err := LoadBookmarks()
 	if err != nil {
 		return nil, err
@@ -155,9 +158,16 @@ func BookmarksForHost(host, user string) ([]Bookmark, error) {
 	}
 	out := make([]Bookmark, 0, len(all))
 	for _, b := range all {
-		if (host == "" || b.Host == host) && (user == "" || b.User == user) {
-			out = append(out, b)
+		if host != "" && b.Host != host {
+			continue
 		}
+		if user != "" && b.User != user {
+			continue
+		}
+		if port != "" && b.Port != "" && b.Port != port {
+			continue
+		}
+		out = append(out, b)
 	}
 	return out, nil
 }
@@ -167,23 +177,23 @@ func AddBookmark(b Bookmark) error {
 	if err != nil {
 		return err
 	}
-	// Dedupe by host+user+path.
+	// Dedupe by host+port+user+path.
 	for _, e := range existing {
-		if e.Host == b.Host && e.User == b.User && e.Path == b.Path {
+		if e.Host == b.Host && e.Port == b.Port && e.User == b.User && e.Path == b.Path {
 			return nil
 		}
 	}
 	return SaveBookmarks(append(existing, b))
 }
 
-func DeleteBookmark(host, user, p string) error {
+func DeleteBookmark(host, port, user, p string) error {
 	existing, err := LoadBookmarks()
 	if err != nil {
 		return err
 	}
 	out := existing[:0]
 	for _, e := range existing {
-		if !(e.Host == host && e.User == user && e.Path == p) {
+		if !(e.Host == host && e.Port == port && e.User == user && e.Path == p) {
 			out = append(out, e)
 		}
 	}

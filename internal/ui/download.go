@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	sftpclient "sftpbrowser/internal/sftp"
+	sftpclient "github.com/art-ps/sftpcommander/internal/sftp"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -23,6 +23,7 @@ const (
 	stateEditDest downloadState = iota
 	stateDownloading
 	stateAskContinue
+	stateAskOverwrite
 	stateDone
 )
 
@@ -31,12 +32,35 @@ type failureInfo struct {
 	err  error
 }
 
+type overwriteAsk struct {
+	path         string
+	existingSize int64
+	newSize      int64
+}
+
+// resumable reports whether the existing destination is a strict prefix
+// candidate of the new source — only then does OverwriteResume make sense.
+// Equal sizes are excluded because they'd produce a zero-byte resume, and
+// existing > new can't be a partial transfer of the new file.
+func resumable(a *overwriteAsk) bool {
+	if a == nil {
+		return false
+	}
+	return a.existingSize > 0 && a.existingSize < a.newSize
+}
+
+type overwriteEvent struct {
+	silent *overwriteAsk
+}
+
 type downloadEvent struct {
-	progress   *sftpclient.DownloadProgress
-	failure    *failureInfo
-	silentSkip *failureInfo
-	done       bool
-	finalErr   error
+	progress         *sftpclient.DownloadProgress
+	failure          *failureInfo
+	silentSkip       *failureInfo
+	overwrite        *overwriteAsk
+	silentOverwrite  *overwriteEvent
+	done             bool
+	finalErr         error
 }
 
 type downloadEventMsg downloadEvent
@@ -47,31 +71,38 @@ const (
 	choiceSkip userChoice = iota
 	choiceSkipAll
 	choiceAbort
+	choiceOverwrite
+	choiceOverwriteAll
+	choiceResume
 )
 
 type DownloadModel struct {
-	client      *sftpclient.Client
-	entries     []sftpclient.FileEntry
-	localDir    string
-	destInput   textinput.Model
-	state       downloadState
-	bar         progress.Model
-	written     int64
-	total       int64
-	err         string
-	failure     *failureInfo
-	skipped     []string
-	skipAllOn   bool
-	startTime   time.Time
-	width       int
-	height      int
-	eventCh     chan downloadEvent
-	decisionCh  chan userChoice
-	currentFile string
-	scanning    bool
-	scanFile    string
-	filesDone   int64
-	filesTotal  int64
+	client          *sftpclient.Client
+	entries         []sftpclient.FileEntry
+	localDir        string
+	destInput       textinput.Model
+	state           downloadState
+	bar             progress.Model
+	written         int64
+	total           int64
+	err             string
+	failure         *failureInfo
+	overwrite       *overwriteAsk
+	skipped         []string
+	overwritten     int
+	skipAllOn       bool
+	overwriteAllOn  bool
+	startTime       time.Time
+	width           int
+	height          int
+	eventCh         chan downloadEvent
+	decisionCh      chan userChoice
+	currentFile     string
+	scanning        bool
+	scanFile        string
+	filesDone       int64
+	filesTotal      int64
+	verify          bool
 }
 
 func NewDownloadModel(client *sftpclient.Client, entries []sftpclient.FileEntry, localDir string) DownloadModel {
@@ -107,6 +138,8 @@ func (m DownloadModel) startDownload() tea.Cmd {
 	return func() tea.Msg {
 		aborted := false
 		skipAll := false
+		overwriteAll := false
+		skipAllOverwrite := false
 		onFailure := func(path string, err error) sftpclient.FailureDecision {
 			if aborted {
 				return sftpclient.DecisionAbort
@@ -128,6 +161,39 @@ func (m DownloadModel) startDownload() tea.Cmd {
 				return sftpclient.DecisionAbort
 			default:
 				return sftpclient.DecisionSkip
+			}
+		}
+		onOverwrite := func(path string, existingSize, newSize int64) sftpclient.OverwriteDecision {
+			if aborted {
+				return sftpclient.OverwriteAbort
+			}
+			if overwriteAll {
+				return sftpclient.OverwriteReplace
+			}
+			if skipAllOverwrite {
+				select {
+				case m.eventCh <- downloadEvent{silentOverwrite: &overwriteEvent{silent: &overwriteAsk{path: path, existingSize: existingSize, newSize: newSize}}}:
+				default:
+				}
+				return sftpclient.OverwriteSkip
+			}
+			m.eventCh <- downloadEvent{overwrite: &overwriteAsk{path: path, existingSize: existingSize, newSize: newSize}}
+			switch <-m.decisionCh {
+			case choiceOverwrite:
+				return sftpclient.OverwriteReplace
+			case choiceOverwriteAll:
+				overwriteAll = true
+				return sftpclient.OverwriteReplace
+			case choiceResume:
+				return sftpclient.OverwriteResume
+			case choiceSkipAll:
+				skipAllOverwrite = true
+				return sftpclient.OverwriteSkip
+			case choiceAbort:
+				aborted = true
+				return sftpclient.OverwriteAbort
+			default:
+				return sftpclient.OverwriteSkip
 			}
 		}
 		progressCb := func(p sftpclient.DownloadProgress) {
@@ -155,7 +221,8 @@ func (m DownloadModel) startDownload() tea.Cmd {
 			})
 		}
 
-		if err := m.client.DownloadBatch(items, sftpclient.BatchOptions{Parallel: 4}, progressCb, onFailure); err != nil {
+		opts := sftpclient.BatchOptions{Parallel: 4, OnOverwrite: onOverwrite, Verify: m.verify}
+		if err := m.client.DownloadBatch(items, opts, progressCb, onFailure); err != nil {
 			m.eventCh <- downloadEvent{done: true, finalErr: err}
 			return nil
 		}
@@ -225,7 +292,12 @@ func (m DownloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if ev.progress.ScanFile != "" {
 				m.scanning = true
 				m.scanFile = ev.progress.ScanFile
-				m.filesTotal++
+				if ev.progress.FilesTotal > 0 {
+					m.filesTotal = ev.progress.FilesTotal
+				}
+				if ev.progress.Total > 0 {
+					m.total = ev.progress.Total
+				}
 			} else {
 				m.scanning = false
 				m.written = ev.progress.Written
@@ -239,6 +311,15 @@ func (m DownloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.failure = ev.failure
 			m.state = stateAskContinue
 			return m, nil
+		case ev.overwrite != nil:
+			m.overwrite = ev.overwrite
+			m.state = stateAskOverwrite
+			return m, nil
+		case ev.silentOverwrite != nil:
+			if ev.silentOverwrite.silent != nil {
+				m.skipped = append(m.skipped, ev.silentOverwrite.silent.path)
+			}
+			return m, m.waitForEvent()
 		case ev.silentSkip != nil:
 			m.skipped = append(m.skipped, ev.silentSkip.path)
 			return m, m.waitForEvent()
@@ -261,10 +342,60 @@ func (m DownloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, func() tea.Msg { return backToBrowserMsg{} }
 			case "enter":
 				return m, m.beginDownload()
+			case "ctrl+v":
+				m.verify = !m.verify
+				return m, nil
 			}
 			var cmd tea.Cmd
 			m.destInput, cmd = m.destInput.Update(msg)
 			return m, cmd
+
+		case stateAskOverwrite:
+			switch msg.String() {
+			case "o", "enter":
+				m.overwritten++
+				m.decisionCh <- choiceOverwrite
+				m.overwrite = nil
+				m.state = stateDownloading
+				return m, m.waitForEvent()
+			case "O":
+				m.overwriteAllOn = true
+				m.decisionCh <- choiceOverwriteAll
+				m.overwrite = nil
+				m.state = stateDownloading
+				return m, m.waitForEvent()
+			case "r":
+				if m.overwrite == nil || !resumable(m.overwrite) {
+					return m, nil
+				}
+				m.decisionCh <- choiceResume
+				m.overwrite = nil
+				m.state = stateDownloading
+				return m, m.waitForEvent()
+			case "s", "y":
+				if m.overwrite != nil {
+					m.skipped = append(m.skipped, m.overwrite.path)
+				}
+				m.decisionCh <- choiceSkip
+				m.overwrite = nil
+				m.state = stateDownloading
+				return m, m.waitForEvent()
+			case "S", "A":
+				if m.overwrite != nil {
+					m.skipped = append(m.skipped, m.overwrite.path)
+				}
+				m.skipAllOn = true
+				m.decisionCh <- choiceSkipAll
+				m.overwrite = nil
+				m.state = stateDownloading
+				return m, m.waitForEvent()
+			case "esc", "ctrl+c", "a":
+				m.decisionCh <- choiceAbort
+				m.overwrite = nil
+				m.state = stateDownloading
+				return m, m.waitForEvent()
+			}
+			return m, nil
 
 		case stateAskContinue:
 			switch msg.String() {
@@ -347,6 +478,8 @@ func (m DownloadModel) View() string {
 		}
 	case stateAskContinue:
 		heading = "  File error"
+	case stateAskOverwrite:
+		heading = "  File exists"
 	case stateDone:
 		heading = "  Download complete"
 	}
@@ -370,7 +503,13 @@ func (m DownloadModel) View() string {
 			body = append(body, errStyle.Render("  Error: "+m.err))
 		}
 		body = append(body, "")
-		body = append(body, "  "+keyHint("enter", "start")+"   "+keyHint("esc", "cancel"))
+		verifyTag := "off"
+		if m.verify {
+			verifyTag = styleStatusOk.Render("on")
+		}
+		body = append(body, styleKeyHint.Render("  SHA256 verify: "+verifyTag))
+		body = append(body, "")
+		body = append(body, "  "+keyHint("enter", "start")+"   "+keyHint("^v", "toggle verify")+"   "+keyHint("esc", "cancel"))
 
 	case stateAskContinue:
 		path := ""
@@ -388,6 +527,29 @@ func (m DownloadModel) View() string {
 		body = append(body, errStyle.Render("  "+errMsg))
 		body = append(body, "")
 		body = append(body, "  "+keyHint("enter", "skip")+"   "+keyHint("c", "skip all")+"   "+keyHint("esc", "abort"))
+
+	case stateAskOverwrite:
+		p := ""
+		exist := int64(0)
+		newSz := int64(0)
+		if m.overwrite != nil {
+			p = m.overwrite.path
+			exist = m.overwrite.existingSize
+			newSz = m.overwrite.newSize
+		}
+		wrapStyle := lipgloss.NewStyle().Width(bodyWidth)
+		body = append(body, styleKeyHint.Render("  Destination already exists:"))
+		body = append(body, wrapStyle.Foreground(colorWarning).Render("  "+p))
+		body = append(body, "")
+		body = append(body, styleKeyHint.Render(fmt.Sprintf("  existing: %s   new: %s",
+			formatSize(exist), formatSize(newSz))))
+		body = append(body, "")
+		hints := "  " + keyHint("o/↵", "overwrite") + "   " + keyHint("O", "overwrite all")
+		if resumable(m.overwrite) {
+			hints += "   " + keyHint("r", "resume")
+		}
+		hints += "   " + keyHint("s", "skip") + "   " + keyHint("S", "skip all") + "   " + keyHint("esc", "abort")
+		body = append(body, hints)
 
 	case stateDownloading, stateDone:
 		if m.scanning && m.state == stateDownloading {

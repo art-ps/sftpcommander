@@ -13,6 +13,7 @@ type SSHConfigEntry struct {
 	Port         string
 	User         string
 	IdentityFile string
+	ProxyJump    string
 }
 
 // LookupSSHConfig parses ~/.ssh/config and returns the directives that apply
@@ -84,5 +85,6 @@ func LookupSSHConfig(alias string) SSHConfigEntry {
 		Port:         get("Port"),
 		User:         get("User"),
 		IdentityFile: identity,
+		ProxyJump:    strings.TrimSpace(get("ProxyJump")),
 	}
 }

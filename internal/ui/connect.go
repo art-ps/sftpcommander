@@ -3,7 +3,7 @@ package ui
 import (
 	"strings"
 
-	sftpclient "sftpbrowser/internal/sftp"
+	sftpclient "github.com/art-ps/sftpcommander/internal/sftp"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -37,6 +37,7 @@ type ConnectedMsg struct {
 	Password      string
 	KeyPath       string
 	KeyPassphrase string
+	ProxyJump     string
 }
 
 type sshConfigMsg struct {
@@ -50,6 +51,7 @@ type ConnectModel struct {
 	width     int
 	height    int
 	sshFilled [fieldCount]bool // true when a field was set from ~/.ssh/config
+	proxyJump string           // captured from ssh_config lookup; not user-editable
 }
 
 func NewConnectModel() ConnectModel {
@@ -94,6 +96,7 @@ func (m *ConnectModel) Prefill(c ConnectedMsg) {
 	m.inputs[fieldUser].SetValue(c.User)
 	m.inputs[fieldKeyPath].SetValue(c.KeyPath)
 	m.inputs[fieldPassword].SetValue("")
+	m.proxyJump = c.ProxyJump
 	for i := range m.sshFilled {
 		m.sshFilled[i] = false
 	}
@@ -120,6 +123,7 @@ func (m ConnectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sshConfigMsg:
 		e := msg.entry
+		m.proxyJump = e.ProxyJump
 		if e.HostName != "" {
 			m.inputs[fieldHost].SetValue(e.HostName)
 		}
@@ -197,13 +201,15 @@ func (m ConnectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if port == "" {
 				port = "22"
 			}
+			proxy := m.proxyJump
 			return m, func() tea.Msg {
 				return ConnectedMsg{
-					Host:     host,
-					Port:     port,
-					User:     user,
-					Password: m.inputs[fieldPassword].Value(),
-					KeyPath:  strings.TrimSpace(m.inputs[fieldKeyPath].Value()),
+					Host:      host,
+					Port:      port,
+					User:      user,
+					Password:  m.inputs[fieldPassword].Value(),
+					KeyPath:   strings.TrimSpace(m.inputs[fieldKeyPath].Value()),
+					ProxyJump: proxy,
 				}
 			}
 		}

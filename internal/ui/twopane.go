@@ -1,15 +1,27 @@
 package ui
 
 import (
-	sftpclient "sftpbrowser/internal/sftp"
+	"errors"
+	"fmt"
+
+	sftpclient "github.com/art-ps/sftpcommander/internal/sftp"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
+var errCrossFsMoveUnsupported = errors.New("cross-fs move not supported (use F5 to copy, then delete source)")
+
 // Messages emitted by TwoPane (handled by App).
 type backToSinglePaneMsg struct{}
 type refreshTwoPaneMsg struct{}
+
+// bothPanesOpDoneMsg is emitted by ops that touch both panels (e.g. move).
+// The TwoPane handler refreshes left and right after seeing it.
+type bothPanesOpDoneMsg struct {
+	op  string
+	err error
+}
 
 type TwoPaneModel struct {
 	left   BrowserModel
@@ -78,13 +90,39 @@ func (m TwoPaneModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.right, cmdR = updateAs[BrowserModel](m.right, refreshSignalMsg{side: 1})
 		return m, tea.Batch(cmdL, cmdR)
 
+	case bothPanesOpDoneMsg:
+		var cmdL, cmdR tea.Cmd
+		m.left, cmdL = updateAs[BrowserModel](m.left, refreshSignalMsg{side: 0})
+		m.right, cmdR = updateAs[BrowserModel](m.right, refreshSignalMsg{side: 1})
+		// Clear stale selection on the side that initiated the op so it does
+		// not point at moved/renamed paths.
+		m.left.selection = make(map[string]bool)
+		m.right.selection = make(map[string]bool)
+		if msg.err != nil {
+			if m.active == 0 {
+				m.left.err = msg.op + " failed: " + msg.err.Error()
+			} else {
+				m.right.err = msg.op + " failed: " + msg.err.Error()
+			}
+		}
+		return m, tea.Batch(cmdL, cmdR)
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "tab":
 			m.swap()
 			return m, nil
+		case "ctrl+u":
+			m.swapPanels()
+			return m, nil
+		case "E":
+			return m, func() tea.Msg { return openErrLogMsg{} }
 		case "f5":
 			return m, m.copyToOther()
+		case "f6":
+			return m, m.moveToOther()
+		case "=":
+			return m, m.alignPaths()
 		case "f2", "ctrl+w":
 			return m, func() tea.Msg { return backToSinglePaneMsg{} }
 		case "ctrl+c":
@@ -109,6 +147,49 @@ func (m *TwoPaneModel) swap() {
 	m.active = 1 - m.active
 }
 
+// swapPanels exchanges the entire state of left and right (path, fs, cursor,
+// selection, …). Side identifiers are kept where they are: the side tag
+// determines where async msgs land, and rerouting in-flight List() callbacks
+// after a swap would be hairy. Visually the user sees the panels swap.
+func (m *TwoPaneModel) swapPanels() {
+	m.left, m.right = m.right, m.left
+	// Restore side tags so messages keep landing where they started.
+	m.left.side = 0
+	m.right.side = 1
+	// Focused flag follows active index, not panel content.
+	m.left.focused = m.active == 0
+	m.right.focused = m.active == 1
+}
+
+// alignPaths cd's the inactive panel to the active panel's path. Only works
+// when both panels are on the same kind of FS — a local panel can't open a
+// remote path and vice versa.
+func (m TwoPaneModel) alignPaths() tea.Cmd {
+	src := m.activePanel()
+	dst := m.inactivePanel()
+	if src.fs.Kind() != dst.fs.Kind() {
+		dst.err = "align: different FS kind (" + src.fs.Kind() + " vs " + dst.fs.Kind() + ")"
+		if m.active == 0 {
+			m.right = *dst
+		} else {
+			m.left = *dst
+		}
+		return nil
+	}
+	if src.path == dst.path {
+		return nil
+	}
+	dst.cursorMem[dst.path] = cursorState{dst.cursor, dst.offset}
+	dst.loading = true
+	cmd := dst.loadDir(src.path)
+	if m.active == 0 {
+		m.right = *dst
+	} else {
+		m.left = *dst
+	}
+	return cmd
+}
+
 func (m TwoPaneModel) activePanel() *BrowserModel {
 	if m.active == 0 {
 		return &m.left
@@ -121,6 +202,44 @@ func (m TwoPaneModel) inactivePanel() *BrowserModel {
 		return &m.right
 	}
 	return &m.left
+}
+
+// moveToOther moves selected entries from the active panel into the
+// inactive panel's current directory. Only supports same-fs moves where a
+// single rename is atomic — currently that means both panels are remote on
+// the same SSH connection. Mixed local/remote moves would need copy+delete
+// which isn't implemented yet (#TODO Move).
+func (m TwoPaneModel) moveToOther() tea.Cmd {
+	src := m.activePanel()
+	dst := m.inactivePanel()
+	items := src.targets()
+	if len(items) == 0 {
+		return nil
+	}
+	if src.fs.Kind() != dst.fs.Kind() {
+		op := "move"
+		return func() tea.Msg {
+			return bothPanesOpDoneMsg{op: op, err: errCrossFsMoveUnsupported}
+		}
+	}
+	fs := src.fs
+	destDir := dst.path
+	targets := make([]string, len(items))
+	for i, e := range items {
+		targets[i] = e.Path
+	}
+	return func() tea.Msg {
+		for _, t := range targets {
+			newPath := fs.Join(destDir, fs.Base(t))
+			if t == newPath {
+				continue
+			}
+			if err := fs.Rename(t, newPath); err != nil {
+				return bothPanesOpDoneMsg{op: "move", err: err}
+			}
+		}
+		return bothPanesOpDoneMsg{op: fmt.Sprintf("moved %d", len(targets))}
+	}
 }
 
 // copyToOther dispatches a cross-panel transfer. Direction is inferred from
@@ -180,6 +299,9 @@ func (m TwoPaneModel) View() string {
 		Padding(0, 1).
 		Render(keyHint("tab", "switch") + "  " +
 			keyHint("F5", "copy →") + "  " +
+			keyHint("F6", "move →") + "  " +
+			keyHint("=", "align path →") + "  " +
+			keyHint("^u", "swap panels") + "  " +
 			keyHint("f2/^w", "single-pane") + "  " +
 			keyHint("?", "help") + "  " +
 			keyHint("q", "quit"))

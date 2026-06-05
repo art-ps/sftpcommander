@@ -2,27 +2,83 @@ package ui
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Palette is chosen once at startup from SFTP_THEME (dark|light). Default is
+// dark — matches the original colour scheme. Light mode swaps fg/bg families
+// and tones down accents that overpower a bright background.
 var (
-	colorPrimary   = lipgloss.Color("#7C3AED")
-	colorSecondary = lipgloss.Color("#A78BFA")
-	colorAccent    = lipgloss.Color("#10B981")
-	colorMuted     = lipgloss.Color("#6B7280")
-	colorError     = lipgloss.Color("#EF4444")
-	colorWarning   = lipgloss.Color("#F59E0B")
-	colorText      = lipgloss.Color("#F9FAFB")
-	colorBg        = lipgloss.Color("#1F2937")
-	colorBgAlt     = lipgloss.Color("#111827")
-	colorBorder    = lipgloss.Color("#374151")
-	colorSelected  = lipgloss.Color("#4C1D95")
+	colorPrimary   lipgloss.Color
+	colorSecondary lipgloss.Color
+	colorAccent    lipgloss.Color
+	colorMuted     lipgloss.Color
+	colorError     lipgloss.Color
+	colorWarning   lipgloss.Color
+	colorText      lipgloss.Color
+	colorBg        lipgloss.Color
+	colorBgAlt     lipgloss.Color
+	colorBorder    lipgloss.Color
+	colorSelected  lipgloss.Color
+)
 
+func init() {
+	switch os.Getenv("SFTP_THEME") {
+	case "light":
+		colorPrimary = lipgloss.Color("#6D28D9")
+		colorSecondary = lipgloss.Color("#7C3AED")
+		colorAccent = lipgloss.Color("#047857")
+		colorMuted = lipgloss.Color("#6B7280")
+		colorError = lipgloss.Color("#B91C1C")
+		colorWarning = lipgloss.Color("#B45309")
+		colorText = lipgloss.Color("#111827")
+		colorBg = lipgloss.Color("#F9FAFB")
+		colorBgAlt = lipgloss.Color("#E5E7EB")
+		colorBorder = lipgloss.Color("#9CA3AF")
+		colorSelected = lipgloss.Color("#DDD6FE")
+	default:
+		colorPrimary = lipgloss.Color("#7C3AED")
+		colorSecondary = lipgloss.Color("#A78BFA")
+		colorAccent = lipgloss.Color("#10B981")
+		colorMuted = lipgloss.Color("#6B7280")
+		colorError = lipgloss.Color("#EF4444")
+		colorWarning = lipgloss.Color("#F59E0B")
+		colorText = lipgloss.Color("#F9FAFB")
+		colorBg = lipgloss.Color("#1F2937")
+		colorBgAlt = lipgloss.Color("#111827")
+		colorBorder = lipgloss.Color("#374151")
+		colorSelected = lipgloss.Color("#4C1D95")
+	}
+	initStyles()
+}
+
+var (
+	styleLogo      lipgloss.Style
+	styleTitle     lipgloss.Style
+	styleSubtitle  lipgloss.Style
+	stylePanel     lipgloss.Style
+	styleSelected  lipgloss.Style
+	styleNormal    lipgloss.Style
+	styleDir       lipgloss.Style
+	styleFile      lipgloss.Style
+	styleSize      lipgloss.Style
+	styleStatusBar lipgloss.Style
+	styleStatusOk  lipgloss.Style
+	styleStatusErr lipgloss.Style
+	styleKeyHint   lipgloss.Style
+	styleKey       lipgloss.Style
+	styleError     lipgloss.Style
+	styleProgress  lipgloss.Style
+	stylePath      lipgloss.Style
+)
+
+func initStyles() {
 	styleLogo = lipgloss.NewStyle().
-			Foreground(colorSecondary).
-			Bold(true).
-			PaddingBottom(1)
+		Foreground(colorSecondary).
+		Bold(true).
+		PaddingBottom(1)
 
 	styleTitle = lipgloss.NewStyle().
 			Foreground(colorText).
@@ -93,9 +149,9 @@ var (
 			Foreground(colorAccent)
 
 	stylePath = lipgloss.NewStyle().
-			Foreground(colorWarning).
-			Bold(true)
-)
+		Foreground(colorWarning).
+		Bold(true)
+}
 
 func keyHint(key, desc string) string {
 	return styleKey.Render(key) + styleKeyHint.Render(" "+desc)

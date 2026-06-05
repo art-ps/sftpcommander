@@ -3,8 +3,8 @@ package ui
 import (
 	"fmt"
 
-	"sftpbrowser/internal/config"
-	sftpclient "sftpbrowser/internal/sftp"
+	"github.com/art-ps/sftpcommander/internal/config"
+	sftpclient "github.com/art-ps/sftpcommander/internal/sftp"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -115,6 +115,9 @@ func (m ConnListModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Port:    e.port,
 				User:    e.user,
 				KeyPath: e.keyPath,
+			}
+			if e.fromSSH {
+				prefill.ProxyJump = sftpclient.LookupSSHConfig(e.name).ProxyJump
 			}
 			if prefill.Port == "" {
 				prefill.Port = "22"
