@@ -270,7 +270,7 @@ func (m ConnectModel) View() string {
 
 	content := lipgloss.JoinVertical(lipgloss.Center,
 		styleLogo.Render(logo),
-		styleTitle.Render("  SFTP Browser  "),
+		styleTitle.Render("  SFTP Commander  "),
 		"\n",
 		panel,
 	)

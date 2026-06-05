@@ -123,20 +123,20 @@ type findResultsMsg struct {
 }
 
 type BrowserModel struct {
-	fs        FileSystem
-	side      int // identifier so two-pane mode can route async msgs back
-	path      string
+	fs            FileSystem
+	side          int // identifier so two-pane mode can route async msgs back
+	path          string
 	entries       []sftpclient.FileEntry // raw from fs
 	sortedEntries []sftpclient.FileEntry // entries sorted by current sortBy/sortDesc (cache)
 	visible       []sftpclient.FileEntry // filtered subset of sortedEntries (buffer reused)
-	cursor    int
-	offset    int
-	loading   bool
-	err       string
-	status    string
-	width     int
-	height    int
-	selection map[string]bool
+	cursor        int
+	offset        int
+	loading       bool
+	err           string
+	status        string
+	width         int
+	height        int
+	selection     map[string]bool
 
 	showHidden bool
 	sortBy     sortMode
@@ -300,9 +300,10 @@ func (m *BrowserModel) applyView() {
 // compileFilter returns a name-match predicate from the user's filter string.
 // Recognised forms:
 //   - "re:PATTERN"       — Go regexp, case-insensitive, anchored loosely (any
-//                          match counts; use ^/$ for anchoring).
+//     match counts; use ^/$ for anchoring).
 //   - contains * or ?    — glob via path.Match against the basename.
 //   - anything else      — case-insensitive substring match.
+//
 // An invalid regex/glob falls back to literal substring matching so the user
 // keeps seeing results while typing.
 func compileFilter(raw string) func(string) bool {
@@ -839,7 +840,7 @@ func (m BrowserModel) runFind(root, pattern string) tea.Cmd {
 	const limit = 5000
 	return func() tea.Msg {
 		var (
-			results []sftpclient.FileEntry
+			results  []sftpclient.FileEntry
 			firstErr error
 		)
 		var walk func(dir string)
@@ -1070,7 +1071,7 @@ func (m BrowserModel) View() string {
 	// Header bar
 	header := lipgloss.NewStyle().Width(m.width).MaxHeight(1).Render(
 		lipgloss.JoinHorizontal(lipgloss.Left,
-			styleTitle.Render("  SFTP Browser  "),
+			styleTitle.Render("  SFTP Commander  "),
 			"  ",
 			styleSubtitle.Render(truncate(m.fs.Label(), max(0, m.width-20))),
 		),
@@ -1574,4 +1575,3 @@ func formatMTime(t time.Time) string {
 	}
 	return t.Format("Jan _2  2006")
 }
-

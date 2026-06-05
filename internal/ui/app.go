@@ -54,9 +54,10 @@ type App struct {
 	edit        EditModel
 	errLogView  ErrLogModel
 	errLog      []errLogEntry
-	pendingConn *ConnectedMsg
-	width       int
-	height      int
+	pendingConn  *ConnectedMsg
+	browserReady bool // single-pane browser has been Init()ed
+	width        int
+	height       int
 
 	// client is the active SFTP connection. Owned by App so Download/Upload/
 	// TwoPane can build their models against a single source of truth.
@@ -229,12 +230,14 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.client = msg.client
 		remoteFS := NewCachedFS(NewRemoteFS(msg.client, msg.connInfo))
 		a.browser = NewBrowserModel(remoteFS)
+		a.browserReady = false
 		a.twoPane = NewTwoPaneModel(msg.client, NewCachedFS(NewLocalFS()), remoteFS)
 		a.current = viewTwoPane
-		// Re-send window size so both views compute their layout.
-		a.browser, _ = updateAs[BrowserModel](a.browser, tea.WindowSizeMsg{Width: a.width, Height: a.height})
+		// Only init twoPane here; the single-pane browser is lazily initialised
+		// in backToSinglePaneMsg so its loadDir command does not race with the
+		// two-pane left panel (both share side=0).
 		a.twoPane, _ = updateAs[TwoPaneModel](a.twoPane, tea.WindowSizeMsg{Width: a.width, Height: a.height})
-		return a, tea.Batch(a.browser.Init(), a.twoPane.Init())
+		return a, a.twoPane.Init()
 
 	case passphraseEnteredMsg:
 		if a.pendingConn == nil {
@@ -333,6 +336,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case backToSinglePaneMsg:
 		a.current = viewBrowser
+		if !a.browserReady {
+			a.browserReady = true
+			a.browser, _ = updateAs[BrowserModel](a.browser, tea.WindowSizeMsg{Width: a.width, Height: a.height})
+			return a, a.browser.Init()
+		}
 		return a, nil
 
 	case openBookmarksMsg:

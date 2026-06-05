@@ -11,13 +11,13 @@ import (
 )
 
 type connEntry struct {
-	name        string
-	host        string
-	port        string
-	user        string
-	keyPath     string
-	fromSSH     bool
-	fromSaved   bool
+	name      string
+	host      string
+	port      string
+	user      string
+	keyPath   string
+	fromSSH   bool
+	fromSaved bool
 }
 
 type openConnectFormMsg struct {
@@ -129,7 +129,7 @@ func (m ConnListModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m ConnListModel) View() string {
-	heading := styleTitle.Render("  SFTP Browser — connections  ")
+	heading := styleTitle.Render("  SFTP Commander — connections  ")
 
 	if len(m.entries) == 0 {
 		body := []string{

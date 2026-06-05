@@ -14,8 +14,9 @@ layout, parallel transfers, and full SSH-config integration.
 
 </div>
 
-> [!NOTE]
-> Screenshots / demo GIF coming soon. Drop them under `docs/` and link from here.
+<p align="center">
+  <img src="docs/demo.gif" alt="sftpcommander demo" width="900">
+</p>
 
 ## Table of contents
 
